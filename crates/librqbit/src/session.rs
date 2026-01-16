@@ -150,6 +150,7 @@ pub struct Session {
     // Feature flags
     #[cfg(feature = "disable-upload")]
     _disable_upload: bool,
+    pub ipv4_only: bool,
     pub peer_limit: Option<usize>,
 }
 
@@ -463,6 +464,9 @@ pub struct SessionOptions {
 
     /// Disable LSD multicast
     pub disable_local_service_discovery: bool,
+
+    /// Force IPv4 only.
+    pub ipv4_only: bool,
 }
 
 fn torrent_file_from_info_bytes(info_bytes: &[u8], trackers: &[url::Url]) -> anyhow::Result<Bytes> {
@@ -679,6 +683,7 @@ impl Session {
                     socks_proxy_config: proxy_config,
                     utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
                     bind_device: bind_device.clone(),
+                    ipv4_only: opts.ipv4_only,
                 })
                 .await
                 .context("error creating stream connector")?,
@@ -750,6 +755,7 @@ impl Session {
                 )),
                 udp_tracker_client,
                 ratelimits: Limits::new(opts.ratelimits),
+                ipv4_only: opts.ipv4_only,
                 trackers: opts.trackers,
                 disable_trackers: opts.disable_trackers,
                 peer_limit: opts.peer_limit,
