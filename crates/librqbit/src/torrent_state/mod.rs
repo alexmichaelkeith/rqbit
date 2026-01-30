@@ -242,6 +242,14 @@ impl ManagedTorrent {
         self.locked.read().only_files.clone()
     }
 
+    pub fn reconcile_active_requests(&self) {
+        self.with_state(|s| {
+            if let ManagedTorrentState::Live(live) = s {
+                live.reconcile_active_requests();
+            }
+        });
+    }
+
     pub fn with_state<R>(&self, f: impl FnOnce(&ManagedTorrentState) -> R) -> R {
         f(&self.locked.read().state)
     }

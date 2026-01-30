@@ -128,6 +128,18 @@ impl TorrentStreams {
     pub(crate) fn streamed_file_ids(&self) -> impl Iterator<Item = usize> + '_ {
         self.streams.iter().map(|s| s.value().file_id)
     }
+
+    pub(crate) fn get_interested_pieces(&self, lengths: &Lengths) -> std::collections::HashSet<ValidPieceIndex> {
+        let mut interested = std::collections::HashSet::new();
+        for s in self.streams.iter() {
+            interested.extend(s.queue(lengths));
+        }
+        interested
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
 }
 
 pub struct FileStream {
@@ -264,6 +276,7 @@ impl AsyncSeek for FileStream {
 
         self.as_mut().set_position(map_io_err!(new_pos.try_into())?);
         debug!(stream_id = self.stream_id, position = self.position, "seek");
+        self.torrent.reconcile_active_requests();
         Ok(())
     }
 
@@ -278,6 +291,7 @@ impl AsyncSeek for FileStream {
 impl Drop for FileStream {
     fn drop(&mut self) {
         self.streams.drop_stream(self.stream_id);
+        self.torrent.reconcile_active_requests();
     }
 }
 

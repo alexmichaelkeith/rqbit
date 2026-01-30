@@ -213,6 +213,15 @@ pub struct TorrentStateLive {
 }
 
 impl TorrentStateLive {
+    pub fn reconcile_active_requests(&self) {
+        if self.streams.is_empty() {
+            return;
+        }
+        let streams = self.streams.get_interested_pieces(&self.lengths);
+        self.peers
+            .cancel_requests_not_meeting_predicate(|idx| streams.contains(idx));
+    }
+
     pub(crate) fn new(
         paused: TorrentStatePaused,
         fatal_errors_tx: tokio::sync::oneshot::Sender<anyhow::Error>,

@@ -175,4 +175,32 @@ impl PeerStates {
             }
         });
     }
+
+    pub(crate) fn cancel_requests_not_meeting_predicate(
+        &self,
+        keep: impl Fn(&ValidPieceIndex) -> bool,
+    ) {
+        for mut r in self.states.iter_mut() {
+            let peer = r.value_mut();
+            if let Some(live) = peer.get_live_mut() {
+                let to_remove = live
+                    .inflight_requests
+                    .iter()
+                    .filter(|r| !keep(&r.piece_index))
+                    .copied()
+                    .collect::<Vec<_>>();
+
+                for req in to_remove {
+                    live.inflight_requests.remove(&req);
+                    let _ = live
+                        .tx
+                        .send(WriterRequest::Message(Message::Cancel(Request {
+                            index: req.piece_index.get(),
+                            begin: req.offset,
+                            length: req.size,
+                        })));
+                }
+            }
+        }
+    }
 }
