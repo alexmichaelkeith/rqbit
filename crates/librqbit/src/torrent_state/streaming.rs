@@ -34,6 +34,10 @@ struct StreamState {
     file_abs_offset: u64,
     position: u64,
     waker: Option<Waker>,
+    /// Optional priority pieces for this stream. When set, these pieces are
+    /// yielded first in the stream's queue, before the normal lookahead pieces.
+    /// This is used for seek prioritization without affecting other streams.
+    priority_pieces: Option<Vec<ValidPieceIndex>>,
 }
 
 impl StreamState {
@@ -41,13 +45,21 @@ impl StreamState {
         lengths.compute_current_piece(self.position, self.file_abs_offset)
     }
 
-    fn queue<'a>(&self, lengths: &'a Lengths) -> impl Iterator<Item = ValidPieceIndex> + use<'a> {
+    fn queue(&self, lengths: &Lengths) -> std::vec::IntoIter<ValidPieceIndex> {
+        // Yield priority pieces first (if any), then normal lookahead
+        let priority_pieces = self.priority_pieces.clone().unwrap_or_default();
+        
         let start = self.file_abs_offset + self.position;
         let end = (start + PER_STREAM_BUF_DEFAULT).min(self.file_abs_offset + self.file_len);
         let dpl = lengths.default_piece_length();
         let start_id = (start / dpl as u64).try_into().unwrap();
         let end_id = end.div_ceil(dpl as u64).try_into().unwrap();
-        (start_id..end_id).filter_map(|i| lengths.validate_piece_index(i))
+        let normal_pieces = (start_id..end_id)
+            .filter_map(|i| lengths.validate_piece_index(i));
+        
+        // Collect into owned Vec to avoid lifetime issues with DashMap iteration
+        let all_pieces: Vec<_> = priority_pieces.into_iter().chain(normal_pieces).collect();
+        all_pieces.into_iter()
     }
 }
 
@@ -127,6 +139,29 @@ impl TorrentStreams {
 
     pub(crate) fn streamed_file_ids(&self) -> impl Iterator<Item = usize> + '_ {
         self.streams.iter().map(|s| s.value().file_id)
+    }
+
+    /// Set priority pieces for a specific stream. These pieces will be requested
+    /// before the normal lookahead pieces for this stream only.
+    /// 
+    /// This is opt-in: if never called, the stream behaves normally.
+    /// Call with `None` to clear priority and return to normal behavior.
+    /// 
+    /// Use case: when a user seeks, set priority to the seek target piece(s)
+    /// so they are downloaded first, without affecting other streams.
+    pub fn set_stream_priority(&self, stream_id: StreamId, pieces: Option<Vec<ValidPieceIndex>>) {
+        if let Some(mut s) = self.streams.get_mut(&stream_id) {
+            s.value_mut().priority_pieces = pieces;
+        }
+    }
+
+    /// Get the stream ID for a given stream. Useful for callers who need to
+    /// set priority on a stream they've opened.
+    #[allow(dead_code)]
+    pub fn get_stream_id_by_file(&self, file_id: usize) -> Option<StreamId> {
+        self.streams.iter()
+            .find(|s| s.value().file_id == file_id)
+            .map(|s| *s.key())
     }
 }
 
@@ -367,6 +402,7 @@ impl ManagedTorrent {
                 waker: None,
                 file_len: fd_len,
                 file_abs_offset: fd_offset,
+                priority_pieces: None,
             },
         );
 
@@ -397,5 +433,22 @@ impl FileStream {
 
     pub fn len(&self) -> u64 {
         self.file_len
+    }
+
+    /// Get the stream ID for this stream.
+    pub fn stream_id(&self) -> usize {
+        self.stream_id
+    }
+
+    /// Set priority pieces for this stream. These pieces will be requested
+    /// before the normal lookahead pieces, allowing faster seeking.
+    /// 
+    /// This is opt-in: if never called, the stream behaves normally.
+    /// Call with `None` to clear priority and return to normal behavior.
+    /// 
+    /// Example: when seeking to a position, calculate the target piece(s)
+    /// and call `set_priority(Some(vec![target_piece, target_piece + 1]))`.
+    pub fn set_priority(&self, pieces: Option<Vec<ValidPieceIndex>>) {
+        self.streams.set_stream_priority(self.stream_id, pieces);
     }
 }
