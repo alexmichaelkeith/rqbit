@@ -1452,9 +1452,10 @@ impl PeerHandler {
         }
 
         // A 4MB piece has ~256 chunks (16KB each). 
-        // At 4MB/s, should complete in 1s. After 2s with < 128 chunks = too slow.
-        const SLOW_THRESHOLD_SECS: u64 = 2;
-        const MIN_CHUNKS_FOR_SLOW_THRESHOLD: u32 = 128; // ~50% of a 4MB piece
+        // At 4MB/s, should complete in 1s. After 1.5s with < 96 chunks (~37%) = too slow.
+        // Aggressive thresholds for faster cold start streaming.
+        const SLOW_THRESHOLD_SECS: f64 = 1.5;
+        const MIN_CHUNKS_FOR_SLOW_THRESHOLD: u32 = 96; // ~37% of a 4MB piece
 
         let (stolen_idx, from_peer, steal_reason) = {
             let mut g = self.state.lock_write("try_steal_priority_piece");
@@ -1477,7 +1478,7 @@ impl PeerHandler {
                 let steal_reason: Option<&'static str> = if stall_time > stall_timeout {
                     // STALL: No chunks received recently → peer is dead
                     Some("stalled")
-                } else if total_time > Duration::from_secs(SLOW_THRESHOLD_SECS) 
+                } else if total_time > Duration::from_secs_f64(SLOW_THRESHOLD_SECS) 
                        && req.chunks_received < MIN_CHUNKS_FOR_SLOW_THRESHOLD {
                     // SLOW: Been working > 2s but < 50% progress → peer is too slow
                     Some("slow")
@@ -1788,12 +1789,13 @@ impl PeerHandler {
             // Try steal priority pieces first with a short absolute timeout.
             // This is critical for cold start streaming: don't wait 5+ seconds for
             // a slow peer to download piece 0.
+            // 500ms stall timeout = faster detection of dead peers for cold start.
             // Then try steal from very slow peers (10x threshold).
             // Then try get the next one in queue.
             // Afterwards means we are close to completion, try stealing more aggressively.
             let new_piece_notify = self.state.new_pieces_notify.notified();
             let next = match self
-                .try_steal_priority_piece(Duration::from_secs(1))
+                .try_steal_priority_piece(Duration::from_millis(500))
                 .or_else(|| self.try_steal_old_slow_piece(10.))
                 .map_or_else(|| self.reserve_next_needed_piece(), |v| Ok(Some(v)))?
                 .or_else(|| self.try_steal_old_slow_piece(3.))
