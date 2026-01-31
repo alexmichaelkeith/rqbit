@@ -1422,8 +1422,9 @@ impl PeerHandler {
     /// This is critical for cold start streaming: the first peer to grab piece 0
     /// might be slow, and we need faster peers to steal it quickly.
     /// 
-    /// We use STALL detection rather than pure timeout: only steal if the current
-    /// holder hasn't received any chunks recently, indicating they're stuck.
+    /// Hybrid steal detection:
+    /// 1. STALL: No chunks received for stall_timeout → peer is dead
+    /// 2. SLOW: Piece started > 2s ago with < 50% progress → peer is too slow
     fn try_steal_priority_piece(&self, stall_timeout: Duration) -> Option<ValidPieceIndex> {
         // Get ACTUAL priority pieces set by streams (not just what iter_next_pieces returns)
         let all_priority = self.state.streams.get_all_priority_pieces();
@@ -1450,11 +1451,16 @@ impl PeerHandler {
             return None;
         }
 
-        let (stolen_idx, from_peer) = {
+        // A 4MB piece has ~256 chunks (16KB each). 
+        // At 4MB/s, should complete in 1s. After 2s with < 128 chunks = too slow.
+        const SLOW_THRESHOLD_SECS: u64 = 2;
+        const MIN_CHUNKS_FOR_SLOW_THRESHOLD: u32 = 128; // ~50% of a 4MB piece
+
+        let (stolen_idx, from_peer, steal_reason) = {
             let mut g = self.state.lock_write("try_steal_priority_piece");
             
-            // Find in-flight priority pieces that are STALLED (no recent chunk activity)
-            let mut best_candidate: Option<(ValidPieceIndex, Duration, SocketAddr, u32)> = None;
+            // Find in-flight priority pieces that are STALLED or SLOW
+            let mut best_candidate: Option<(ValidPieceIndex, &'static str, Duration, SocketAddr, u32)> = None;
             
             for (idx, req) in g.inflight_pieces.iter() {
                 if req.peer == self.addr {
@@ -1464,53 +1470,77 @@ impl PeerHandler {
                     continue; // Not a priority piece
                 }
                 
-                // Use time since last chunk, not time since started
                 let stall_time = req.last_chunk_received.elapsed();
+                let total_time = req.started.elapsed();
                 
-                // Log every priority piece check for piece 0, 1, or cues
-                if idx.get() < 2 || priority_pieces.contains(&idx.get()) {
+                // Determine steal reason
+                let steal_reason: Option<&'static str> = if stall_time > stall_timeout {
+                    // STALL: No chunks received recently → peer is dead
+                    Some("stalled")
+                } else if total_time > Duration::from_secs(SLOW_THRESHOLD_SECS) 
+                       && req.chunks_received < MIN_CHUNKS_FOR_SLOW_THRESHOLD {
+                    // SLOW: Been working > 2s but < 50% progress → peer is too slow
+                    Some("slow")
+                } else {
+                    None
+                };
+                
+                // Log priority piece checks
+                if idx.get() < 2 || idx.get() == 2113 {
                     debug!(
                         piece = idx.get(),
                         stall_ms = stall_time.as_millis(),
+                        total_ms = total_time.as_millis(),
                         chunks_received = req.chunks_received,
                         stall_timeout_ms = stall_timeout.as_millis(),
+                        steal_reason = ?steal_reason,
                         holder = %req.peer,
-                        "checking priority piece for stall-based steal"
+                        "checking priority piece for steal"
                     );
                 }
                 
-                // Only consider this piece if it's stalled (no chunks received recently)
-                if stall_time <= stall_timeout {
-                    continue; // Still receiving chunks, don't steal
-                }
+                let reason = match steal_reason {
+                    Some(r) => r,
+                    None => continue, // Not stealable
+                };
                 
-                // Prefer stealing pieces with the longest stall time
-                if let Some((_, best_stall, _, _)) = best_candidate {
-                    if stall_time > best_stall {
-                        best_candidate = Some((*idx, stall_time, req.peer, req.chunks_received));
+                // Prefer stealing pieces with the worst situation
+                // Priority: stalled > slow, then by longest stall/total time
+                let priority_score = match reason {
+                    "stalled" => (1, stall_time),
+                    "slow" => (0, total_time),
+                    _ => continue,
+                };
+                
+                if let Some((_, best_reason, best_time, _, _)) = best_candidate {
+                    let best_score = match best_reason {
+                        "stalled" => (1, best_time),
+                        _ => (0, best_time),
+                    };
+                    if priority_score > best_score {
+                        best_candidate = Some((*idx, reason, stall_time.max(total_time), req.peer, req.chunks_received));
                     }
                 } else {
-                    best_candidate = Some((*idx, stall_time, req.peer, req.chunks_received));
+                    best_candidate = Some((*idx, reason, stall_time.max(total_time), req.peer, req.chunks_received));
                 }
             }
             
-            let (idx, stall_time, holder, chunks) = best_candidate?;
+            let (idx, reason, time, holder, chunks) = best_candidate?;
             
-            // We found a stalled piece - steal it!
+            // We found a stealable piece - steal it!
             if let Some(_g) = self.state.per_piece_locks[idx.get_usize()].try_write() {
-                // Need to get mutable reference to actually steal
                 if let Some(piece_req) = g.inflight_pieces.get_mut(&idx) {
-                    if piece_req.peer != self.addr && piece_req.last_chunk_received.elapsed() > stall_timeout {
+                    if piece_req.peer != self.addr {
                         info!(
-                            "🎯 STEALING stalled priority piece {} from {}: no chunks for {:?} (had {} chunks), stall_timeout {:?}",
-                            idx, piece_req.peer, stall_time, chunks, stall_timeout
+                            "🎯 STEALING {} priority piece {} from {}: {:?} elapsed, {} chunks received",
+                            reason, idx, piece_req.peer, time, chunks
                         );
                         let old = piece_req.peer;
                         piece_req.peer = self.addr;
                         piece_req.started = Instant::now();
                         piece_req.last_chunk_received = Instant::now();
-                        // Keep chunks_received - new peer continues from where old peer left off
-                        (idx, old)
+                        piece_req.chunks_received = 0; // Reset for new peer
+                        (idx, old, reason)
                     } else {
                         return None;
                     }
