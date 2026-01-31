@@ -1342,13 +1342,35 @@ impl PeerHandler {
                     let mut n_opt = None;
                     let bf = &live.bitfield;
                     let chunk_tracker = g.get_chunks()?;
+                    
+                    // Debug: log inflight pieces early on
+                    let inflight_count = g.inflight_pieces.len();
+                    if inflight_count < 20 {
+                        let inflight_ids: Vec<_> = g.inflight_pieces.keys().map(|p| p.get()).collect();
+                        debug!(
+                            ?inflight_ids,
+                            inflight_count,
+                            "reserve_next_needed_piece: current inflight pieces"
+                        );
+                    }
+                    
                     let priority_streamed_pieces = self
                         .state
                         .streams
                         .iter_next_pieces(&self.state.lengths)
                         .filter(|pid| {
-                            !chunk_tracker.is_piece_have(*pid)
-                                && !g.inflight_pieces.contains_key(pid)
+                            let have = chunk_tracker.is_piece_have(*pid);
+                            let inflight = g.inflight_pieces.contains_key(pid);
+                            // Log why pieces are filtered for first few pieces
+                            if pid.get() < 5 && (have || inflight) {
+                                debug!(
+                                    piece_id = pid.get(),
+                                    have,
+                                    inflight,
+                                    "priority piece filtered out"
+                                );
+                            }
+                            !have && !inflight
                         });
                     let natural_order_pieces = chunk_tracker
                         .iter_queued_pieces(&g.file_priorities, &self.state.metadata.file_infos);
@@ -1360,7 +1382,16 @@ impl PeerHandler {
                     }
 
                     match n_opt {
-                        Some(n_opt) => n_opt,
+                        Some(n_opt) => {
+                            // Log which piece was selected
+                            if n_opt.get() < 20 {
+                                debug!(
+                                    piece_id = n_opt.get(),
+                                    "reserve_next_needed_piece: selected piece"
+                                );
+                            }
+                            n_opt
+                        }
                         None => return Ok(None),
                     }
                 };
@@ -1376,6 +1407,107 @@ impl PeerHandler {
             })
             .transpose()
             .map(|r| r.flatten())
+    }
+
+    /// Try to steal a priority/streaming piece that has been in-flight too long.
+    /// Uses an absolute timeout rather than relative speed, so it works even
+    /// when this peer hasn't downloaded any pieces yet.
+    /// 
+    /// This is critical for cold start streaming: the first peer to grab piece 0
+    /// might be slow, and we need faster peers to steal it quickly.
+    fn try_steal_priority_piece(&self, timeout: Duration) -> Option<ValidPieceIndex> {
+        // Get ACTUAL priority pieces set by streams (not just what iter_next_pieces returns)
+        let all_priority = self.state.streams.get_all_priority_pieces();
+        let stream_count = self.state.streams.stream_count();
+        
+        // ALWAYS log at INFO level for first peer call to diagnose cold start issues
+        // Only log once per peer (when they have 0 completed pieces)
+        let my_completed = self.counters.downloaded_and_checked_pieces.load(std::sync::atomic::Ordering::Relaxed);
+        if my_completed == 0 {
+            info!(
+                stream_count,
+                priority_count = all_priority.len(),
+                priority_pieces = ?all_priority.iter().take(5).map(|p| p.get()).collect::<Vec<_>>(),
+                "🔍 try_steal_priority_piece: first check for this peer"
+            );
+        }
+        
+        let priority_pieces: std::collections::HashSet<u32> = all_priority
+            .into_iter()
+            .map(|p| p.get())
+            .collect();
+        
+        if priority_pieces.is_empty() {
+            return None;
+        }
+
+        let (stolen_idx, from_peer) = {
+            let mut g = self.state.lock_write("try_steal_priority_piece");
+            
+            // Find the oldest in-flight priority piece that's held by another peer
+            let mut best_candidate: Option<(ValidPieceIndex, Duration, SocketAddr)> = None;
+            
+            for (idx, req) in g.inflight_pieces.iter() {
+                if req.peer == self.addr {
+                    continue; // Don't steal from myself
+                }
+                if !priority_pieces.contains(&idx.get()) {
+                    continue; // Not a priority piece
+                }
+                let elapsed = req.started.elapsed();
+                
+                // Log every priority piece check for piece 0 or 1
+                if idx.get() < 2 {
+                    debug!(
+                        piece = idx.get(),
+                        elapsed_ms = elapsed.as_millis(),
+                        timeout_ms = timeout.as_millis(),
+                        holder = %req.peer,
+                        "checking priority piece for steal"
+                    );
+                }
+                
+                if let Some((_, best_elapsed, _)) = best_candidate {
+                    if elapsed > best_elapsed {
+                        best_candidate = Some((*idx, elapsed, req.peer));
+                    }
+                } else {
+                    best_candidate = Some((*idx, elapsed, req.peer));
+                }
+            }
+            
+            let (idx, elapsed, holder) = best_candidate?;
+            
+            // Steal if it's been too long (absolute timeout)
+            if elapsed > timeout {
+                if let Some(_g) = self.state.per_piece_locks[idx.get_usize()].try_write() {
+                    // Need to get mutable reference to actually steal
+                    if let Some(piece_req) = g.inflight_pieces.get_mut(&idx) {
+                        if piece_req.peer != self.addr && piece_req.started.elapsed() > timeout {
+                            info!(
+                                "🎯 STEALING priority piece {} from {}: elapsed {:?} > timeout {:?}",
+                                idx, piece_req.peer, elapsed, timeout
+                            );
+                            let old = piece_req.peer;
+                            piece_req.peer = self.addr;
+                            piece_req.started = Instant::now();
+                            (idx, old)
+                        } else {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        };
+
+        self.state.peers.on_steal(from_peer, self.addr, stolen_idx);
+        Some(stolen_idx)
     }
 
     /// Try to steal a piece from a slower peer. Threshold is
@@ -1605,13 +1737,16 @@ impl PeerHandler {
             update_interest(self, true)?;
             aframe!(self.wait_for_unchoke()).await;
 
-            // Try steal a piece from a very slow peer first. Otherwise we might wait too long
-            // to download early pieces.
+            // Try steal priority pieces first with a short absolute timeout.
+            // This is critical for cold start streaming: don't wait 5+ seconds for
+            // a slow peer to download piece 0.
+            // Then try steal from very slow peers (10x threshold).
             // Then try get the next one in queue.
             // Afterwards means we are close to completion, try stealing more aggressively.
             let new_piece_notify = self.state.new_pieces_notify.notified();
             let next = match self
-                .try_steal_old_slow_piece(10.)
+                .try_steal_priority_piece(Duration::from_secs(2))
+                .or_else(|| self.try_steal_old_slow_piece(10.))
                 .map_or_else(|| self.reserve_next_needed_piece(), |v| Ok(Some(v)))?
                 .or_else(|| self.try_steal_old_slow_piece(3.))
             {

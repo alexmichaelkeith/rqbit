@@ -74,10 +74,22 @@ impl TorrentStreams {
         self.next_stream_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Get the number of active streams.
+    pub fn stream_count(&self) -> usize {
+        self.streams.len()
+    }
+
     fn register_waker(&self, stream_id: StreamId, waker: Waker) {
         if let Some(mut s) = self.streams.get_mut(&stream_id) {
             let vm = s.value_mut();
+            let position = vm.position;
             vm.waker = Some(waker);
+            debug!(
+                stream_id,
+                position,
+                "registered waker for stream at position {}",
+                position
+            );
         }
     }
 
@@ -105,6 +117,22 @@ impl TorrentStreams {
         }
 
         let mut all: Vec<_> = self.streams.iter().map(|s| s.queue(lengths)).collect();
+        
+        // Log what streams we have and their priority pieces (for cold start debugging)
+        if !all.is_empty() {
+            let stream_ids: Vec<_> = self.streams.iter().map(|s| *s.key()).collect();
+            let has_priority: Vec<_> = self.streams.iter()
+                .filter_map(|s| s.priority_pieces.as_ref().map(|p| (*s.key(), p.iter().map(|x| x.get()).collect::<Vec<_>>())))
+                .collect();
+            if !has_priority.is_empty() {
+                debug!(
+                    stream_count = all.len(),
+                    ?stream_ids,
+                    ?has_priority,
+                    "iter_next_pieces: streams with priority"
+                );
+            }
+        }
 
         // Shuffle to decrease determinism and make queueing fairer.
         use rand::seq::SliceRandom;
@@ -118,12 +146,41 @@ impl TorrentStreams {
         piece_id: ValidPieceIndex,
         lengths: &Lengths,
     ) {
+        let stream_count = self.streams.len();
+        if piece_id.get() < 5 {
+            // Log for first few pieces to debug cold start
+            debug!(
+                piece_id = piece_id.get(),
+                stream_count,
+                "wake_streams_on_piece_completed: checking {} streams",
+                stream_count
+            );
+        }
+        
         for mut w in self.streams.iter_mut() {
-            if w.value().current_piece(lengths).map(|p| p.id) == Some(piece_id)
+            let stream_id = *w.key();
+            let current = w.value().current_piece(lengths);
+            let current_piece_id = current.as_ref().map(|p| p.id);
+            let has_waker = w.value().waker.is_some();
+            
+            if piece_id.get() < 5 {
+                // Detailed debug for first few pieces
+                debug!(
+                    stream_id,
+                    piece_id = piece_id.get(),
+                    current_piece = ?current_piece_id.map(|p| p.get()),
+                    has_waker,
+                    position = w.value().position,
+                    file_offset = w.value().file_abs_offset,
+                    "stream state check"
+                );
+            }
+            
+            if current_piece_id == Some(piece_id)
                 && let Some(waker) = w.value_mut().waker.take()
             {
                 debug!(
-                    stream_id = *w.key(),
+                    stream_id,
                     piece_id = piece_id.get(),
                     "waking stream"
                 );
@@ -151,8 +208,34 @@ impl TorrentStreams {
     /// so they are downloaded first, without affecting other streams.
     pub fn set_stream_priority(&self, stream_id: StreamId, pieces: Option<Vec<ValidPieceIndex>>) {
         if let Some(mut s) = self.streams.get_mut(&stream_id) {
+            let piece_ids: Vec<u32> = pieces.as_ref()
+                .map(|p| p.iter().map(|x| x.get()).collect())
+                .unwrap_or_default();
+            debug!(
+                stream_id,
+                ?piece_ids,
+                "set_stream_priority: setting priority pieces"
+            );
             s.value_mut().priority_pieces = pieces;
+        } else {
+            debug!(
+                stream_id,
+                "set_stream_priority: stream not found in DashMap!"
+            );
         }
+    }
+
+    /// Get all priority pieces from all streams. This returns the actual
+    /// priority_pieces that were set via set_stream_priority, not filtered
+    /// by have/inflight status.
+    pub fn get_all_priority_pieces(&self) -> Vec<ValidPieceIndex> {
+        let mut all_priority: Vec<ValidPieceIndex> = Vec::new();
+        for entry in self.streams.iter() {
+            if let Some(ref pieces) = entry.value().priority_pieces {
+                all_priority.extend(pieces.iter().cloned());
+            }
+        }
+        all_priority
     }
 
     /// Get the stream ID for a given stream. Useful for callers who need to
