@@ -45,21 +45,19 @@ impl StreamState {
         lengths.compute_current_piece(self.position, self.file_abs_offset)
     }
 
-    fn queue(&self, lengths: &Lengths) -> std::vec::IntoIter<ValidPieceIndex> {
-        // Yield priority pieces first (if any), then normal lookahead
-        let priority_pieces = self.priority_pieces.clone().unwrap_or_default();
-        
+    /// Returns only the normal lookahead pieces (without priority pieces).
+    /// Priority pieces are handled separately by iter_next_pieces to ensure they 
+    /// take absolute precedence over ALL streams' non-priority pieces.
+    fn queue_without_priority(&self, lengths: &Lengths) -> std::vec::IntoIter<ValidPieceIndex> {
         let start = self.file_abs_offset + self.position;
         let end = (start + PER_STREAM_BUF_DEFAULT).min(self.file_abs_offset + self.file_len);
         let dpl = lengths.default_piece_length();
         let start_id = (start / dpl as u64).try_into().unwrap();
         let end_id = end.div_ceil(dpl as u64).try_into().unwrap();
-        let normal_pieces = (start_id..end_id)
-            .filter_map(|i| lengths.validate_piece_index(i));
-        
-        // Collect into owned Vec to avoid lifetime issues with DashMap iteration
-        let all_pieces: Vec<_> = priority_pieces.into_iter().chain(normal_pieces).collect();
-        all_pieces.into_iter()
+        let normal_pieces: Vec<_> = (start_id..end_id)
+            .filter_map(|i| lengths.validate_piece_index(i))
+            .collect();
+        normal_pieces.into_iter()
     }
 }
 
@@ -93,7 +91,11 @@ impl TorrentStreams {
         }
     }
 
-    // Interleave 1st, 2nd etc pieces from each active stream in turn until they get 1/10th of the file .
+    // Interleave 1st, 2nd etc pieces from each active stream in turn until they get 1/10th of the file.
+    // 
+    // IMPORTANT: Priority pieces from ANY stream are yielded FIRST before any non-priority pieces.
+    // This ensures that seek operations (which set priority pieces) get immediate attention
+    // even when other streams are active at different positions.
     pub(crate) fn iter_next_pieces<'a>(
         &'a self,
         lengths: &'a Lengths,
@@ -116,29 +118,39 @@ impl TorrentStreams {
             }
         }
 
-        let mut all: Vec<_> = self.streams.iter().map(|s| s.queue(lengths)).collect();
+        // Collect ALL priority pieces from ALL streams first - these take absolute precedence
+        // Clone in the same step to avoid lifetime issues with DashMap iteration
+        let all_priority_pieces: Vec<ValidPieceIndex> = self.streams.iter()
+            .filter_map(|s| s.priority_pieces.clone())
+            .flatten()
+            .collect();
         
-        // Log what streams we have and their priority pieces (for cold start debugging)
-        if !all.is_empty() {
+        // Collect normal queues (without priority pieces) for interleaving
+        let mut normal_queues: Vec<_> = self.streams.iter()
+            .map(|s| s.queue_without_priority(lengths))
+            .collect();
+        
+        // Log what streams we have and their priority pieces (for seek/cold start debugging)
+        if !all_priority_pieces.is_empty() {
             let stream_ids: Vec<_> = self.streams.iter().map(|s| *s.key()).collect();
             let has_priority: Vec<_> = self.streams.iter()
                 .filter_map(|s| s.priority_pieces.as_ref().map(|p| (*s.key(), p.iter().map(|x| x.get()).collect::<Vec<_>>())))
                 .collect();
-            if !has_priority.is_empty() {
-                debug!(
-                    stream_count = all.len(),
-                    ?stream_ids,
-                    ?has_priority,
-                    "iter_next_pieces: streams with priority"
-                );
-            }
+            debug!(
+                stream_count = normal_queues.len(),
+                priority_piece_count = all_priority_pieces.len(),
+                ?stream_ids,
+                ?has_priority,
+                "iter_next_pieces: yielding priority pieces first"
+            );
         }
 
-        // Shuffle to decrease determinism and make queueing fairer.
+        // Shuffle normal queues to decrease determinism and make queueing fairer.
         use rand::seq::SliceRandom;
-        all.shuffle(&mut rand::rng());
+        normal_queues.shuffle(&mut rand::rng());
 
-        Interleave { all: all.into() }
+        // Yield priority pieces first, then interleave normal pieces
+        all_priority_pieces.into_iter().chain(Interleave { all: normal_queues.into() })
     }
 
     pub(crate) fn wake_streams_on_piece_completed(
