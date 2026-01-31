@@ -120,9 +120,14 @@ impl TorrentStreams {
 
         // Collect ALL priority pieces from ALL streams first - these take absolute precedence
         // Clone in the same step to avoid lifetime issues with DashMap iteration
+        // IMPORTANT: Deduplicate across streams! Multiple streams may share the same file/position
+        // and thus have identical priority pieces. Without dedup, we waste peer slots on already-inflight pieces.
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
         let all_priority_pieces: Vec<ValidPieceIndex> = self.streams.iter()
             .filter_map(|s| s.priority_pieces.clone())
             .flatten()
+            .filter(|p| seen.insert(p.get()))  // Only yield each piece once
             .collect();
         
         // Collect normal queues (without priority pieces) for interleaving
