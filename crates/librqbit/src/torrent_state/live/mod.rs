@@ -1745,7 +1745,7 @@ impl PeerHandler {
             // Afterwards means we are close to completion, try stealing more aggressively.
             let new_piece_notify = self.state.new_pieces_notify.notified();
             let next = match self
-                .try_steal_priority_piece(Duration::from_secs(2))
+                .try_steal_priority_piece(Duration::from_secs(1))
                 .or_else(|| self.try_steal_old_slow_piece(10.))
                 .map_or_else(|| self.reserve_next_needed_piece(), |v| Ok(Some(v)))?
                 .or_else(|| self.try_steal_old_slow_piece(3.))
