@@ -121,6 +121,10 @@ use super::{
 struct InflightPiece {
     peer: PeerHandle,
     started: Instant,
+    /// Last time a chunk was received for this piece (for stall detection)
+    last_chunk_received: Instant,
+    /// Number of chunks received so far (to detect progress)
+    chunks_received: u32,
 }
 
 fn make_piece_bitfield(lengths: &Lengths) -> BF {
@@ -1400,6 +1404,8 @@ impl PeerHandler {
                     InflightPiece {
                         peer: self.addr,
                         started: Instant::now(),
+                        last_chunk_received: Instant::now(),
+                        chunks_received: 0,
                     },
                 );
                 g.get_chunks_mut()?.reserve_needed_piece(n);
@@ -1415,7 +1421,10 @@ impl PeerHandler {
     /// 
     /// This is critical for cold start streaming: the first peer to grab piece 0
     /// might be slow, and we need faster peers to steal it quickly.
-    fn try_steal_priority_piece(&self, timeout: Duration) -> Option<ValidPieceIndex> {
+    /// 
+    /// We use STALL detection rather than pure timeout: only steal if the current
+    /// holder hasn't received any chunks recently, indicating they're stuck.
+    fn try_steal_priority_piece(&self, stall_timeout: Duration) -> Option<ValidPieceIndex> {
         // Get ACTUAL priority pieces set by streams (not just what iter_next_pieces returns)
         let all_priority = self.state.streams.get_all_priority_pieces();
         let stream_count = self.state.streams.stream_count();
@@ -1444,8 +1453,8 @@ impl PeerHandler {
         let (stolen_idx, from_peer) = {
             let mut g = self.state.lock_write("try_steal_priority_piece");
             
-            // Find the oldest in-flight priority piece that's held by another peer
-            let mut best_candidate: Option<(ValidPieceIndex, Duration, SocketAddr)> = None;
+            // Find in-flight priority pieces that are STALLED (no recent chunk activity)
+            let mut best_candidate: Option<(ValidPieceIndex, Duration, SocketAddr, u32)> = None;
             
             for (idx, req) in g.inflight_pieces.iter() {
                 if req.peer == self.addr {
@@ -1454,47 +1463,54 @@ impl PeerHandler {
                 if !priority_pieces.contains(&idx.get()) {
                     continue; // Not a priority piece
                 }
-                let elapsed = req.started.elapsed();
                 
-                // Log every priority piece check for piece 0 or 1
-                if idx.get() < 2 {
+                // Use time since last chunk, not time since started
+                let stall_time = req.last_chunk_received.elapsed();
+                
+                // Log every priority piece check for piece 0, 1, or cues
+                if idx.get() < 2 || priority_pieces.contains(&idx.get()) {
                     debug!(
                         piece = idx.get(),
-                        elapsed_ms = elapsed.as_millis(),
-                        timeout_ms = timeout.as_millis(),
+                        stall_ms = stall_time.as_millis(),
+                        chunks_received = req.chunks_received,
+                        stall_timeout_ms = stall_timeout.as_millis(),
                         holder = %req.peer,
-                        "checking priority piece for steal"
+                        "checking priority piece for stall-based steal"
                     );
                 }
                 
-                if let Some((_, best_elapsed, _)) = best_candidate {
-                    if elapsed > best_elapsed {
-                        best_candidate = Some((*idx, elapsed, req.peer));
+                // Only consider this piece if it's stalled (no chunks received recently)
+                if stall_time <= stall_timeout {
+                    continue; // Still receiving chunks, don't steal
+                }
+                
+                // Prefer stealing pieces with the longest stall time
+                if let Some((_, best_stall, _, _)) = best_candidate {
+                    if stall_time > best_stall {
+                        best_candidate = Some((*idx, stall_time, req.peer, req.chunks_received));
                     }
                 } else {
-                    best_candidate = Some((*idx, elapsed, req.peer));
+                    best_candidate = Some((*idx, stall_time, req.peer, req.chunks_received));
                 }
             }
             
-            let (idx, elapsed, holder) = best_candidate?;
+            let (idx, stall_time, holder, chunks) = best_candidate?;
             
-            // Steal if it's been too long (absolute timeout)
-            if elapsed > timeout {
-                if let Some(_g) = self.state.per_piece_locks[idx.get_usize()].try_write() {
-                    // Need to get mutable reference to actually steal
-                    if let Some(piece_req) = g.inflight_pieces.get_mut(&idx) {
-                        if piece_req.peer != self.addr && piece_req.started.elapsed() > timeout {
-                            info!(
-                                "🎯 STEALING priority piece {} from {}: elapsed {:?} > timeout {:?}",
-                                idx, piece_req.peer, elapsed, timeout
-                            );
-                            let old = piece_req.peer;
-                            piece_req.peer = self.addr;
-                            piece_req.started = Instant::now();
-                            (idx, old)
-                        } else {
-                            return None;
-                        }
+            // We found a stalled piece - steal it!
+            if let Some(_g) = self.state.per_piece_locks[idx.get_usize()].try_write() {
+                // Need to get mutable reference to actually steal
+                if let Some(piece_req) = g.inflight_pieces.get_mut(&idx) {
+                    if piece_req.peer != self.addr && piece_req.last_chunk_received.elapsed() > stall_timeout {
+                        info!(
+                            "🎯 STEALING stalled priority piece {} from {}: no chunks for {:?} (had {} chunks), stall_timeout {:?}",
+                            idx, piece_req.peer, stall_time, chunks, stall_timeout
+                        );
+                        let old = piece_req.peer;
+                        piece_req.peer = self.addr;
+                        piece_req.started = Instant::now();
+                        piece_req.last_chunk_received = Instant::now();
+                        // Keep chunks_received - new peer continues from where old peer left off
+                        (idx, old)
                     } else {
                         return None;
                     }
@@ -1538,6 +1554,8 @@ impl PeerHandler {
                     let old = piece_req.peer;
                     piece_req.peer = self.addr;
                     piece_req.started = Instant::now();
+                    piece_req.last_chunk_received = Instant::now();
+                    // Keep chunks_received - new peer continues from where old peer left off
                     (*idx, old)
                 } else {
                     debug!(?idx, ?piece_req, "attempted to steal but peer was writing");
@@ -1920,15 +1938,19 @@ impl PeerHandler {
             // we can actually checksum etc.
             // Otherwise it might get into some weird state.
             let ppl_guard = {
-                let g = state.lock_read("check_steal");
+                let mut g = state.lock_write("check_steal_and_update_chunk_progress");
 
                 let ppl = state
                     .per_piece_locks
                     .get(piece.index as usize)
                     .map(|l| l.read());
 
-                match g.inflight_pieces.get(&chunk_info.piece_index) {
-                    Some(InflightPiece { peer, .. }) if *peer == addr => {}
+                match g.inflight_pieces.get_mut(&chunk_info.piece_index) {
+                    Some(inflight) if inflight.peer == addr => {
+                        // Update chunk progress for stall detection
+                        inflight.last_chunk_received = Instant::now();
+                        inflight.chunks_received += 1;
+                    }
                     Some(InflightPiece { peer, .. }) => {
                         debug!(
                             "in-flight piece {} was stolen by {}, ignoring",
