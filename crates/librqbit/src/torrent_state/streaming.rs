@@ -120,15 +120,32 @@ impl TorrentStreams {
 
         // Collect ALL priority pieces from ALL streams first - these take absolute precedence
         // Clone in the same step to avoid lifetime issues with DashMap iteration
-        // IMPORTANT: Deduplicate across streams! Multiple streams may share the same file/position
-        // and thus have identical priority pieces. Without dedup, we waste peer slots on already-inflight pieces.
+        // IMPORTANT: 
+        // 1. Deduplicate across streams! Multiple streams may share the same file/position
+        //    and thus have identical priority pieces.
+        // 2. INTERLEAVE priority pieces across streams! If we just flatten [header: 0,1,2,3] + [cues: 2112,2113],
+        //    all header pieces get requested first and Cues only starts when slots free up.
+        //    By interleaving (0, 2112, 1, 2113, 2, 3), header AND Cues get requested in parallel.
         use std::collections::HashSet;
         let mut seen = HashSet::new();
-        let all_priority_pieces: Vec<ValidPieceIndex> = self.streams.iter()
+        
+        // Collect each stream's priority pieces separately for interleaving
+        let priority_queues: Vec<Vec<ValidPieceIndex>> = self.streams.iter()
             .filter_map(|s| s.priority_pieces.clone())
-            .flatten()
-            .filter(|p| seen.insert(p.get()))  // Only yield each piece once
             .collect();
+        
+        // Interleave priority pieces across streams (round-robin), then deduplicate
+        let mut all_priority_pieces: Vec<ValidPieceIndex> = Vec::new();
+        let max_len = priority_queues.iter().map(|q| q.len()).max().unwrap_or(0);
+        for i in 0..max_len {
+            for queue in &priority_queues {
+                if let Some(&piece) = queue.get(i) {
+                    if seen.insert(piece.get()) {  // Only yield each piece once
+                        all_priority_pieces.push(piece);
+                    }
+                }
+            }
+        }
         
         // Collect normal queues (without priority pieces) for interleaving
         let mut normal_queues: Vec<_> = self.streams.iter()
