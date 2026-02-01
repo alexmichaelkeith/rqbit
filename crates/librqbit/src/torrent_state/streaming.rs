@@ -28,6 +28,14 @@ type StreamId = usize;
 // 32 mb lookahead by default.
 const PER_STREAM_BUF_DEFAULT: u64 = 32 * 1024 * 1024;
 
+// Rolling priority window size (number of pieces ahead to prioritize)
+const COLD_START_PRIORITY_PIECES: u32 = 6;  // Smaller window for fast cold start
+const STEADY_STATE_PRIORITY_PIECES: u32 = 15; // Larger window once playing to avoid stalls
+
+// How many pieces ahead of current before we update the rolling window
+// (avoids updating priority on every single read)
+const PRIORITY_UPDATE_THRESHOLD_PIECES: u32 = 3;
+
 struct StreamState {
     file_id: usize,
     file_len: u64,
@@ -38,6 +46,10 @@ struct StreamState {
     /// yielded first in the stream's queue, before the normal lookahead pieces.
     /// This is used for seek prioritization without affecting other streams.
     priority_pieces: Option<Vec<ValidPieceIndex>>,
+    /// The starting piece of the current priority window (for rolling updates)
+    priority_window_start: Option<u32>,
+    /// Whether this stream has started playing (past cold start)
+    is_playing: bool,
 }
 
 impl StreamState {
@@ -280,6 +292,41 @@ impl TorrentStreams {
             .find(|s| s.value().file_id == file_id)
             .map(|s| *s.key())
     }
+    
+    /// Enable rolling priority for a stream. This sets up the initial priority window
+    /// and enables automatic window updates as the read position advances.
+    /// 
+    /// Call this after cold start priority pieces are downloaded to switch from
+    /// static priority to rolling priority mode.
+    #[allow(dead_code)]
+    pub fn enable_rolling_priority(&self, stream_id: StreamId, current_piece: u32, lengths: &Lengths) {
+        if let Some(mut s) = self.streams.get_mut(&stream_id) {
+            let state = s.value_mut();
+            state.priority_window_start = Some(current_piece);
+            state.is_playing = false; // Will become true after COLD_START_PRIORITY_PIECES
+            
+            // Set initial priority window
+            let window_size = COLD_START_PRIORITY_PIECES;
+            let mut new_priority: Vec<ValidPieceIndex> = Vec::with_capacity(window_size as usize);
+            
+            for i in 0..window_size {
+                let piece_id = current_piece + i;
+                if let Some(valid_piece) = lengths.validate_piece_index(piece_id) {
+                    new_priority.push(valid_piece);
+                }
+            }
+            
+            if !new_priority.is_empty() {
+                debug!(
+                    stream_id,
+                    current_piece,
+                    window_size = new_priority.len(),
+                    "enabled rolling priority with initial window"
+                );
+                state.priority_pieces = Some(new_priority);
+            }
+        }
+    }
 }
 
 pub struct FileStream {
@@ -520,6 +567,8 @@ impl ManagedTorrent {
                 file_len: fd_len,
                 file_abs_offset: fd_offset,
                 priority_pieces: None,
+                priority_window_start: None,
+                is_playing: false,
             },
         );
 
@@ -540,12 +589,93 @@ impl FileStream {
 
     fn set_position(&mut self, new_pos: u64) {
         self.position = new_pos;
-        self.streams
-            .streams
-            .get_mut(&self.stream_id)
-            .unwrap()
-            .value_mut()
-            .position = new_pos;
+        
+        let lengths = self.metadata.lengths();
+        let piece_len = lengths.default_piece_length() as u64;
+        
+        // Calculate current piece based on absolute file offset
+        let abs_pos = self.file_torrent_abs_offset + new_pos;
+        let current_piece = (abs_pos / piece_len) as u32;
+        
+        // Update stream state and check if we need to roll the priority window
+        if let Some(mut state) = self.streams.streams.get_mut(&self.stream_id) {
+            let state = state.value_mut();
+            state.position = new_pos;
+            
+            // Check if we need to update the rolling priority window
+            let should_update = match state.priority_window_start {
+                Some(window_start) => {
+                    // Update when we've consumed THRESHOLD pieces past the window start
+                    current_piece >= window_start + PRIORITY_UPDATE_THRESHOLD_PIECES
+                }
+                None => {
+                    // No priority window set yet - this stream isn't using rolling priority
+                    // (priority was set externally, e.g., by OpenPVR's cold start logic)
+                    false
+                }
+            };
+            
+            if should_update {
+                // Mark as playing once we've advanced past the first few pieces
+                if current_piece >= COLD_START_PRIORITY_PIECES {
+                    state.is_playing = true;
+                }
+                
+                // Calculate new priority window
+                let window_size = if state.is_playing {
+                    STEADY_STATE_PRIORITY_PIECES
+                } else {
+                    COLD_START_PRIORITY_PIECES
+                };
+                
+                let mut new_priority: Vec<ValidPieceIndex> = Vec::with_capacity(window_size as usize);
+                
+                for i in 0..window_size {
+                    let piece_id = current_piece + i;
+                    if let Some(valid_piece) = lengths.validate_piece_index(piece_id) {
+                        new_priority.push(valid_piece);
+                    }
+                }
+                
+                if !new_priority.is_empty() {
+                    let first = new_priority.first().map(|p| p.get()).unwrap_or(0);
+                    let last = new_priority.last().map(|p| p.get()).unwrap_or(0);
+                    debug!(
+                        stream_id = self.stream_id,
+                        current_piece,
+                        window_start = first,
+                        window_end = last,
+                        window_size = new_priority.len(),
+                        is_playing = state.is_playing,
+                        "rolling priority window forward"
+                    );
+                    state.priority_window_start = Some(current_piece);
+                    state.priority_pieces = Some(new_priority);
+                }
+            }
+        }
+    }
+    
+    /// Enable rolling priority for this stream starting at the current position.
+    /// This should be called after cold start is complete to enable automatic
+    /// priority window updates as playback progresses.
+    pub fn enable_rolling_priority(&self) {
+        let lengths = self.metadata.lengths();
+        let piece_len = lengths.default_piece_length() as u64;
+        let abs_pos = self.file_torrent_abs_offset + self.position;
+        let current_piece = (abs_pos / piece_len) as u32;
+        
+        if let Some(mut state) = self.streams.streams.get_mut(&self.stream_id) {
+            let state = state.value_mut();
+            state.priority_window_start = Some(current_piece);
+            state.is_playing = false; // Will become true after advancing past cold start
+            
+            debug!(
+                stream_id = self.stream_id,
+                current_piece,
+                "enabled rolling priority"
+            );
+        }
     }
 
     pub fn len(&self) -> u64 {

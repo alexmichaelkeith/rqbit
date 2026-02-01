@@ -125,6 +125,8 @@ struct InflightPiece {
     last_chunk_received: Instant,
     /// Number of chunks received so far (to detect progress)
     chunks_received: u32,
+    /// Number of times this piece has been stolen (for adaptive timeout)
+    steal_count: u32,
 }
 
 fn make_piece_bitfield(lengths: &Lengths) -> BF {
@@ -1406,6 +1408,7 @@ impl PeerHandler {
                         started: Instant::now(),
                         last_chunk_received: Instant::now(),
                         chunks_received: 0,
+                        steal_count: 0,
                     },
                 );
                 g.get_chunks_mut()?.reserve_needed_piece(n);
@@ -1460,11 +1463,11 @@ impl PeerHandler {
         const SLOW_THRESHOLD_SECS: f64 = 3.0;
         const MIN_CHUNKS_FOR_SLOW_THRESHOLD: u32 = 64; // ~25% of a 4MB piece
 
-        let (stolen_idx, from_peer, steal_reason) = {
+        let (stolen_idx, from_peer, _steal_reason) = {
             let mut g = self.state.lock_write("try_steal_priority_piece");
             
             // Find in-flight priority pieces that are STALLED or SLOW
-            let mut best_candidate: Option<(ValidPieceIndex, &'static str, Duration, SocketAddr, u32)> = None;
+            let mut best_candidate: Option<(ValidPieceIndex, &'static str, Duration, SocketAddr, u32, u32)> = None;
             
             for (idx, req) in g.inflight_pieces.iter() {
                 if req.peer == self.addr {
@@ -1477,8 +1480,18 @@ impl PeerHandler {
                 let stall_time = req.last_chunk_received.elapsed();
                 let total_time = req.started.elapsed();
                 
+                // Adaptive timeout: after 2+ steals, reduce timeout to find a working peer faster
+                // Base: 2000ms, after 2 steals: 1000ms, after 4 steals: 500ms (minimum)
+                let adaptive_stall_timeout = if req.steal_count >= 4 {
+                    Duration::from_millis(500)
+                } else if req.steal_count >= 2 {
+                    Duration::from_millis(1000)
+                } else {
+                    stall_timeout
+                };
+                
                 // Determine steal reason
-                let steal_reason: Option<&'static str> = if stall_time > stall_timeout {
+                let steal_reason: Option<&'static str> = if stall_time > adaptive_stall_timeout {
                     // STALL: No chunks received recently → peer is dead
                     Some("stalled")
                 } else if total_time > Duration::from_secs_f64(SLOW_THRESHOLD_SECS) 
@@ -1497,7 +1510,8 @@ impl PeerHandler {
                         stall_ms = stall_time.as_millis(),
                         total_ms = total_time.as_millis(),
                         chunks_received = req.chunks_received,
-                        stall_timeout_ms = stall_timeout.as_millis(),
+                        steal_count = req.steal_count,
+                        stall_timeout_ms = adaptive_stall_timeout.as_millis(),
                         steal_reason = ?steal_reason,
                         holder = %req.peer,
                         "checking priority piece for steal"
@@ -1517,34 +1531,37 @@ impl PeerHandler {
                     _ => continue,
                 };
                 
-                if let Some((_, best_reason, best_time, _, _)) = best_candidate {
+                if let Some((_, best_reason, best_time, _, _, _)) = best_candidate {
                     let best_score = match best_reason {
                         "stalled" => (1, best_time),
                         _ => (0, best_time),
                     };
                     if priority_score > best_score {
-                        best_candidate = Some((*idx, reason, stall_time.max(total_time), req.peer, req.chunks_received));
+                        best_candidate = Some((*idx, reason, stall_time.max(total_time), req.peer, req.chunks_received, req.steal_count));
                     }
                 } else {
-                    best_candidate = Some((*idx, reason, stall_time.max(total_time), req.peer, req.chunks_received));
+                    best_candidate = Some((*idx, reason, stall_time.max(total_time), req.peer, req.chunks_received, req.steal_count));
                 }
             }
             
-            let (idx, reason, time, holder, chunks) = best_candidate?;
+            let (idx, reason, time, _holder, chunks, _steals) = best_candidate?;
             
             // We found a stealable piece - steal it!
             if let Some(_g) = self.state.per_piece_locks[idx.get_usize()].try_write() {
                 if let Some(piece_req) = g.inflight_pieces.get_mut(&idx) {
                     if piece_req.peer != self.addr {
+                        let new_steal_count = piece_req.steal_count + 1;
                         info!(
-                            "🎯 STEALING {} priority piece {} from {}: {:?} elapsed, {} chunks received",
-                            reason, idx, piece_req.peer, time, chunks
+                            "🎯 STEALING {} priority piece {} from {}: {:?} elapsed, {} chunks received, steal #{} (timeout: {}ms)",
+                            reason, idx, piece_req.peer, time, chunks, new_steal_count,
+                            if new_steal_count >= 4 { 500 } else if new_steal_count >= 2 { 1000 } else { stall_timeout.as_millis() as u64 }
                         );
                         let old = piece_req.peer;
                         piece_req.peer = self.addr;
                         piece_req.started = Instant::now();
                         piece_req.last_chunk_received = Instant::now();
                         piece_req.chunks_received = 0; // Reset for new peer
+                        piece_req.steal_count = new_steal_count; // Increment steal count
                         (idx, old, reason)
                     } else {
                         return None;
