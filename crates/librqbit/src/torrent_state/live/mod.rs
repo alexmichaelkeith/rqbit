@@ -1452,10 +1452,13 @@ impl PeerHandler {
         }
 
         // A 4MB piece has ~256 chunks (16KB each). 
-        // At 4MB/s, should complete in 1s. After 1.5s with < 96 chunks (~37%) = too slow.
-        // Aggressive thresholds for faster cold start streaming.
-        const SLOW_THRESHOLD_SECS: f64 = 1.5;
-        const MIN_CHUNKS_FOR_SLOW_THRESHOLD: u32 = 96; // ~37% of a 4MB piece
+        // At 4MB/s, should complete in 1s. After 3s with < 64 chunks (~25%) = too slow.
+        // More conservative thresholds to avoid "piece ping-pong" where pieces are
+        // constantly stolen before any peer has time to actually download them.
+        // The "slow" check only applies if the peer has received at least 1 chunk
+        // (proving they're actually trying), otherwise we use the stall check.
+        const SLOW_THRESHOLD_SECS: f64 = 3.0;
+        const MIN_CHUNKS_FOR_SLOW_THRESHOLD: u32 = 64; // ~25% of a 4MB piece
 
         let (stolen_idx, from_peer, steal_reason) = {
             let mut g = self.state.lock_write("try_steal_priority_piece");
@@ -1479,8 +1482,9 @@ impl PeerHandler {
                     // STALL: No chunks received recently → peer is dead
                     Some("stalled")
                 } else if total_time > Duration::from_secs_f64(SLOW_THRESHOLD_SECS) 
+                       && req.chunks_received > 0  // Must have received at least 1 chunk
                        && req.chunks_received < MIN_CHUNKS_FOR_SLOW_THRESHOLD {
-                    // SLOW: Been working > 2s but < 50% progress → peer is too slow
+                    // SLOW: Been working > 3s, has started downloading but < 25% progress → peer is too slow
                     Some("slow")
                 } else {
                     None
@@ -1786,16 +1790,21 @@ impl PeerHandler {
             update_interest(self, true)?;
             aframe!(self.wait_for_unchoke()).await;
 
-            // Try steal priority pieces first with a short absolute timeout.
-            // This is critical for cold start streaming: don't wait 5+ seconds for
-            // a slow peer to download piece 0.
-            // 500ms stall timeout = faster detection of dead peers for cold start.
+            // Try steal priority pieces first with a reasonable stall timeout.
+            // This is critical for cold start streaming: don't wait forever for
+            // a dead peer to download piece 0.
+            // 
+            // 2000ms stall timeout = allows for realistic internet RTT (100-500ms)
+            // plus time for the peer to start sending chunks. Too aggressive (500ms)
+            // causes "piece ping-pong" where pieces are constantly stolen before
+            // any peer has time to actually download them.
+            // 
             // Then try steal from very slow peers (10x threshold).
             // Then try get the next one in queue.
             // Afterwards means we are close to completion, try stealing more aggressively.
             let new_piece_notify = self.state.new_pieces_notify.notified();
             let next = match self
-                .try_steal_priority_piece(Duration::from_millis(500))
+                .try_steal_priority_piece(Duration::from_millis(2000))
                 .or_else(|| self.try_steal_old_slow_piece(10.))
                 .map_or_else(|| self.reserve_next_needed_piece(), |v| Ok(Some(v)))?
                 .or_else(|| self.try_steal_old_slow_piece(3.))
