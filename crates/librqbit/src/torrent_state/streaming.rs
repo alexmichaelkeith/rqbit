@@ -25,8 +25,11 @@ use super::{ManagedTorrentHandle, TorrentMetadata};
 
 type StreamId = usize;
 
-// 32 mb lookahead by default.
-const PER_STREAM_BUF_DEFAULT: u64 = 32 * 1024 * 1024;
+// 512 MB lookahead by default. With 16MB pieces, this covers ~32 pieces ahead
+// of the current read position as "normal" (non-priority) lookahead. This prevents
+// the download loop from falling through to natural_order_pieces (sequential from 
+// position 0) when the priority window is exhausted.
+const PER_STREAM_BUF_DEFAULT: u64 = 512 * 1024 * 1024;
 
 // Rolling priority window size (number of pieces ahead to prioritize)
 const COLD_START_PRIORITY_PIECES: u32 = 6;  // Smaller window for fast cold start
