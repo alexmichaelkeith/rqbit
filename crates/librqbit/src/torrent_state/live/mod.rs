@@ -704,6 +704,55 @@ impl TorrentStateLive {
             .map(|c| *c.get_hns())
     }
 
+    /// Returns per-piece state array:
+    ///   0 = empty (needed but not queued or in-flight)
+    ///   1 = have (downloaded + verified)
+    ///   2 = queued (in queue_pieces, waiting for a peer slot)
+    ///   3 = in-flight (currently being downloaded from a peer)
+    ///
+    /// Also returns the list of priority piece indices from active streams.
+    pub fn get_piece_states(&self) -> Option<(Vec<u8>, Vec<u32>)> {
+        let g = self.lock_read("get_piece_states");
+        let chunks = g.get_chunks().ok()?;
+
+        let total = self.lengths.total_pieces() as usize;
+        let mut states = vec![0u8; total];
+
+        // Mark have pieces
+        let have = chunks.get_have_pieces().as_slice();
+        for i in 0..total {
+            if have[i] {
+                states[i] = 1;
+            }
+        }
+
+        // Mark in-flight pieces
+        for piece_id in g.inflight_pieces.keys() {
+            let idx = piece_id.get() as usize;
+            if idx < total && states[idx] != 1 {
+                states[idx] = 3; // in-flight
+            }
+        }
+
+        // Mark queued pieces (needed but not in-flight and not have)
+        // queue_pieces = selected & !have, and reserve_needed_piece removes from it
+        // So queue_pieces minus inflight gives us "queued but not yet in-flight"
+        for piece in chunks.iter_queued_pieces(&g.file_priorities, &self.metadata.file_infos) {
+            let idx = piece.get() as usize;
+            if idx < total && states[idx] == 0 {
+                states[idx] = 2; // queued
+            }
+        }
+
+        // Collect priority pieces from active streams
+        let priority: Vec<u32> = self.streams.get_all_priority_pieces()
+            .iter()
+            .map(|p| p.get())
+            .collect();
+
+        Some((states, priority))
+    }
+
     fn transmit_haves(&self, index: ValidPieceIndex) {
         let _ = self.have_broadcast_tx.send(index);
     }
