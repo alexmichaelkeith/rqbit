@@ -532,6 +532,32 @@ impl ManagedTorrent {
         })
     }
 
+    /// Get the piece-level have bitmap as raw bytes.
+    /// Each bit represents one piece: 1 = have, 0 = need.
+    /// Returns (bitmap_bytes, total_pieces, piece_length).
+    pub fn get_piece_bitmap(&self) -> Option<(Vec<u8>, u32, u32)> {
+        self.with_state(|s| {
+            match s {
+                ManagedTorrentState::Paused(p) => {
+                    let lengths = p.metadata.lengths();
+                    let have = p.chunk_tracker.get_have_pieces();
+                    Some((have.as_bytes().to_vec(), lengths.total_pieces(), lengths.default_piece_length()))
+                }
+                ManagedTorrentState::Live(l) => {
+                    let lengths = l.info().lengths();
+                    l.lock_read("get_piece_bitmap")
+                        .get_chunks()
+                        .ok()
+                        .map(|ct| {
+                            let have = ct.get_have_pieces();
+                            (have.as_bytes().to_vec(), lengths.total_pieces(), lengths.default_piece_length())
+                        })
+                }
+                _ => None,
+            }
+        })
+    }
+
     #[inline(never)]
     pub fn wait_until_initialized(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         async move {
