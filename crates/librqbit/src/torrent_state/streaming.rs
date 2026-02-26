@@ -15,7 +15,7 @@ use dashmap::DashMap;
 use librqbit_core::lengths::{CurrentPiece, Lengths, ValidPieceIndex};
 use tokio::{
     io::{AsyncRead, AsyncSeek},
-    sync::OwnedSemaphorePermit,
+    sync::{OwnedSemaphorePermit, broadcast},
 };
 use tracing::{debug, trace};
 
@@ -53,6 +53,8 @@ struct StreamState {
     priority_window_start: Option<u32>,
     /// Whether this stream has started playing (past cold start)
     is_playing: bool,
+    /// The last time this stream was read from or waited on
+    last_activity: Instant,
 }
 
 impl StreamState {
@@ -76,10 +78,49 @@ impl StreamState {
     }
 }
 
-#[derive(Default)]
+/// A persistent streaming anchor that outlives individual HTTP connections.
+/// Registered by the application layer (e.g., OpenPVR) to tell the engine
+/// "a user is watching at this position" — even when no FileStream is open.
+///
+/// This replaces the old "ghost position" hack. Instead of guessing from
+/// dropped streams, the application explicitly manages anchors via
+/// register/update/unregister calls tied to its own session lifecycle.
+#[derive(Clone, Debug)]
+pub struct StreamingAnchor {
+    pub file_id: usize,
+    pub file_abs_offset: u64,
+    pub position: u64,
+    pub file_len: u64,
+    pub last_updated: Instant,
+}
+
+/// The capacity of the piece completion broadcast channel.
+/// Subscribers that fall behind will skip missed pieces (lossy).
+const PIECE_NOTIFY_CAPACITY: usize = 256;
+
 pub(crate) struct TorrentStreams {
     next_stream_id: AtomicUsize,
     streams: DashMap<StreamId, StreamState>,
+    /// Application-managed streaming anchors keyed by session ID.
+    /// These persist independently of FileStream lifecycle and prevent
+    /// fallback to natural_order_pieces (sequential from piece 0).
+    anchors: DashMap<String, StreamingAnchor>,
+    /// Broadcast channel for piece completion events.
+    /// WebSocket handlers subscribe to this to push real-time piece progress
+    /// to connected clients without polling.
+    piece_completed_tx: broadcast::Sender<u32>,
+}
+
+impl Default for TorrentStreams {
+    fn default() -> Self {
+        let (tx, _) = broadcast::channel(PIECE_NOTIFY_CAPACITY);
+        Self {
+            next_stream_id: AtomicUsize::new(0),
+            streams: DashMap::new(),
+            anchors: DashMap::new(),
+            piece_completed_tx: tx,
+        }
+    }
 }
 
 impl TorrentStreams {
@@ -92,11 +133,91 @@ impl TorrentStreams {
         self.streams.len()
     }
 
+    /// Returns true if there are live streams OR registered streaming anchors.
+    /// This prevents the engine from falling back to natural_order_pieces
+    /// (sequential from piece 0) when all browser connections are briefly closed.
+    pub fn has_streaming_context(&self) -> bool {
+        if self.streams.len() > 0 {
+            return true;
+        }
+        // Check if we have any active anchors (registered by the application layer)
+        !self.anchors.is_empty()
+    }
+
+    /// Register or update a streaming anchor for a session.
+    /// Call this when a user starts streaming, and update it on heartbeats.
+    /// The anchor ensures piece selection stays focused on the user's playback
+    /// position even when all HTTP connections (FileStreams) are temporarily closed.
+    pub fn register_streaming_anchor(
+        &self,
+        session_id: &str,
+        file_id: usize,
+        position: u64,
+        file_abs_offset: u64,
+        file_len: u64,
+    ) {
+        let is_new = !self.anchors.contains_key(session_id);
+        self.anchors.insert(
+            session_id.to_string(),
+            StreamingAnchor {
+                file_id,
+                file_abs_offset,
+                position,
+                file_len,
+                last_updated: Instant::now(),
+            },
+        );
+        if is_new {
+            tracing::info!(
+                session_id,
+                file_id,
+                position,
+                anchor_count = self.anchors.len(),
+                "registered new streaming anchor"
+            );
+        } else {
+            tracing::debug!(
+                session_id,
+                file_id,
+                position,
+                "updated streaming anchor position"
+            );
+        }
+    }
+
+    /// Remove a streaming anchor when a session ends.
+    pub fn unregister_streaming_anchor(&self, session_id: &str) {
+        if self.anchors.remove(session_id).is_some() {
+            tracing::info!(
+                session_id,
+                anchor_count = self.anchors.len(),
+                "unregistered streaming anchor"
+            );
+        }
+    }
+
+    /// Get the number of active streaming anchors.
+    pub fn anchor_count(&self) -> usize {
+        self.anchors.len()
+    }
+
+    /// Subscribe to piece completion events.
+    /// Returns a broadcast receiver that yields the piece index (u32) of each
+    /// completed piece. WebSocket handlers use this to push real-time progress.
+    ///
+    /// If the receiver falls behind, it will get a `Lagged` error and skip
+    /// missed pieces — this is fine since the WS handler can query the full
+    /// bitmap to catch up.
+    pub fn subscribe_piece_completed(&self) -> broadcast::Receiver<u32> {
+        self.piece_completed_tx.subscribe()
+    }
+
     fn register_waker(&self, stream_id: StreamId, waker: Waker) {
         if let Some(mut s) = self.streams.get_mut(&stream_id) {
             let vm = s.value_mut();
             let position = vm.position;
             vm.waker = Some(waker);
+            vm.last_activity = Instant::now();
             debug!(
                 stream_id,
                 position,
@@ -163,22 +284,105 @@ impl TorrentStreams {
         }
         
         // Collect normal queues (without priority pieces) for interleaving
-        let mut normal_queues: Vec<_> = self.streams.iter()
-            .map(|s| s.queue_without_priority(lengths))
-            .collect();
+        // Group streams into "active" (read from in the last 2 seconds) and "inactive"
+        let mut active_queues = Vec::new();
+        let mut inactive_queues = Vec::new();
+        
+        let mut active_stream_debug = Vec::new();
+        
+        for s in self.streams.iter() {
+            let queue = s.value().queue_without_priority(lengths);
+            let has_waker = s.value().waker.is_some();
+            let elapsed = s.value().last_activity.elapsed().as_secs();
+            // A stream is only active if it was read from recently.
+            // Even if it has a waker (is blocked), if the player hasn't polled it
+            // in 2 seconds, we consider it inactive so it doesn't steal priority.
+            let is_active = elapsed < 2;
+            
+            active_stream_debug.push(format!(
+                "stream_id={} pos={} waker={} elapsed={}s -> active={}",
+                s.key(), s.value().position, has_waker, elapsed, is_active
+            ));
+            
+            if is_active {
+                active_queues.push(queue);
+            } else {
+                // Only keep inactive streams that were active recently (e.g., within the last 30 seconds)
+                // This prevents old, abandoned streams from piece 0 from hijacking the download queue
+                // when the player's buffer fills up and the current stream becomes "inactive".
+                if elapsed < 30 {
+                    inactive_queues.push((elapsed, queue));
+                }
+            }
+        }
+        
+        // If we have active streams, only interleave those.
+        // Otherwise, sort inactive streams by how recently they were active, and only use the most recent one.
+        // If there are NO streams at all, use the ghost position (last known playback position)
+        // to generate a fallback queue so we don't revert to downloading from piece 0.
+        let mut normal_queues = if !active_queues.is_empty() {
+            active_queues
+        } else if !inactive_queues.is_empty() {
+            inactive_queues.sort_by_key(|(elapsed, _)| *elapsed);
+            if let Some((_, most_recent_queue)) = inactive_queues.into_iter().next() {
+                vec![most_recent_queue]
+            } else {
+                Vec::new()
+            }
+        } else {
+            // No live streams at all — use streaming anchors if any exist.
+            // Each anchor generates a lookahead queue from its position, just like a live stream would.
+            // Multiple anchors = multiple users = interleaved queues.
+            let anchor_queues: Vec<_> = self.anchors.iter()
+                .map(|entry| {
+                    let anchor = entry.value();
+                    let start = anchor.file_abs_offset + anchor.position;
+                    let end = (start + PER_STREAM_BUF_DEFAULT).min(anchor.file_abs_offset + anchor.file_len);
+                    let dpl = lengths.default_piece_length();
+                    let start_id = (start / dpl as u64).try_into().unwrap();
+                    let end_id = end.div_ceil(dpl as u64).try_into().unwrap();
+                    let pieces: Vec<_> = (start_id..end_id)
+                        .filter_map(|i| lengths.validate_piece_index(i))
+                        .collect();
+                    pieces.into_iter()
+                })
+                .collect();
+            if !anchor_queues.is_empty() {
+                anchor_queues
+            } else {
+                Vec::new()
+            }
+        };
         
         // Log what streams we have and their priority pieces (for seek/cold start debugging)
-        if !all_priority_pieces.is_empty() {
+        static LAST_LOG: AtomicUsize = AtomicUsize::new(0);
+        let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as usize;
+        let last_log = LAST_LOG.swap(now_secs, Ordering::Relaxed);
+        
+        if now_secs - last_log >= 2 {
             let stream_ids: Vec<_> = self.streams.iter().map(|s| *s.key()).collect();
             let has_priority: Vec<_> = self.streams.iter()
                 .filter_map(|s| s.priority_pieces.as_ref().map(|p| (*s.key(), p.iter().map(|x| x.get()).collect::<Vec<_>>())))
                 .collect();
-            debug!(
-                stream_count = normal_queues.len(),
+            
+            let anchor_info: Vec<_> = self.anchors.iter()
+                .map(|entry| {
+                    let a = entry.value();
+                    let piece = (a.file_abs_offset + a.position) / lengths.default_piece_length() as u64;
+                    format!("{}:piece={}", entry.key(), piece)
+                })
+                .collect();
+                
+            tracing::info!(
+                stream_count = self.streams.len(),
+                active_queues = normal_queues.len(),
                 priority_piece_count = all_priority_pieces.len(),
+                anchor_count = self.anchors.len(),
+                ?anchor_info,
                 ?stream_ids,
                 ?has_priority,
-                "iter_next_pieces: yielding priority pieces first"
+                streams_status = ?active_stream_debug,
+                "iter_next_pieces: stream status check"
             );
         }
 
@@ -195,52 +399,83 @@ impl TorrentStreams {
         piece_id: ValidPieceIndex,
         lengths: &Lengths,
     ) {
+        // Broadcast piece completion to any WebSocket subscribers.
+        // Ignore send errors — means no subscribers are listening.
+        let _ = self.piece_completed_tx.send(piece_id.get());
+
         let stream_count = self.streams.len();
-        if piece_id.get() < 5 {
-            // Log for first few pieces to debug cold start
-            debug!(
-                piece_id = piece_id.get(),
-                stream_count,
-                "wake_streams_on_piece_completed: checking {} streams",
-                stream_count
-            );
-        }
+        let anchor_count = self.anchors.len();
+        
+        // Always log at debug, but also at info for seek debugging when streams are waiting
+        debug!(
+            piece_id = piece_id.get(),
+            stream_count,
+            anchor_count,
+            "piece completed, checking {} streams",
+            stream_count
+        );
+        
+        let mut woke_count = 0usize;
         
         for mut w in self.streams.iter_mut() {
             let stream_id = *w.key();
             let current = w.value().current_piece(lengths);
             let current_piece_id = current.as_ref().map(|p| p.id);
             let has_waker = w.value().waker.is_some();
-            
-            if piece_id.get() < 5 {
-                // Detailed debug for first few pieces
-                debug!(
-                    stream_id,
-                    piece_id = piece_id.get(),
-                    current_piece = ?current_piece_id.map(|p| p.get()),
-                    has_waker,
-                    position = w.value().position,
-                    file_offset = w.value().file_abs_offset,
-                    "stream state check"
-                );
-            }
+            let position = w.value().position;
+            let file_offset = w.value().file_abs_offset;
             
             if current_piece_id == Some(piece_id)
                 && let Some(waker) = w.value_mut().waker.take()
             {
-                debug!(
+                tracing::debug!(
                     stream_id,
                     piece_id = piece_id.get(),
-                    "waking stream"
+                    position,
+                    position_mb = position / 1024 / 1024,
+                    "✅ WAKING STREAM: piece matches current read position"
                 );
                 waker.wake();
+                woke_count += 1;
+            } else if has_waker {
+                // Stream is waiting but not for this piece — log for diagnostics
+                debug!(
+                    stream_id,
+                    completed_piece = piece_id.get(),
+                    waiting_for_piece = ?current_piece_id.map(|p| p.get()),
+                    position,
+                    position_mb = position / 1024 / 1024,
+                    file_offset,
+                    "stream waiting for different piece"
+                );
             }
+        }
+        
+        if stream_count > 0 && woke_count == 0 {
+            debug!(
+                piece_id = piece_id.get(),
+                stream_count,
+                "piece completed but no streams were waiting for it"
+            );
         }
     }
 
     fn drop_stream(&self, stream_id: StreamId) -> Option<StreamState> {
         debug!(stream_id, "dropping stream");
-        self.streams.remove(&stream_id).map(|s| s.1)
+        let removed = self.streams.remove(&stream_id).map(|s| s.1);
+        
+        if let Some(ref state) = removed {
+            tracing::info!(
+                stream_id,
+                position = state.position,
+                file_abs_offset = state.file_abs_offset,
+                remaining_streams = self.streams.len(),
+                anchor_count = self.anchors.len(),
+                "stream dropped (anchors maintain piece selection context)"
+            );
+        }
+        
+        removed
     }
 
     pub(crate) fn streamed_file_ids(&self) -> impl Iterator<Item = usize> + '_ {
@@ -260,12 +495,22 @@ impl TorrentStreams {
             let piece_ids: Vec<u32> = pieces.as_ref()
                 .map(|p| p.iter().map(|x| x.get()).collect())
                 .unwrap_or_default();
-            debug!(
+            tracing::info!(
                 stream_id,
                 ?piece_ids,
                 "set_stream_priority: setting priority pieces"
             );
-            s.value_mut().priority_pieces = pieces;
+            
+            let state = s.value_mut();
+            state.priority_pieces = pieces;
+            
+            // If we're setting new priority pieces, anchor the rolling window to the first piece
+            // so that subsequent seek() calls don't immediately overwrite these carefully chosen pieces.
+            if let Some(ref p) = state.priority_pieces {
+                if let Some(first_piece) = p.first() {
+                    state.priority_window_start = Some(first_piece.get());
+                }
+            }
         } else {
             debug!(
                 stream_id,
@@ -389,6 +634,18 @@ impl AsyncRead for FileStream {
                 .context("invalid position")
         );
 
+        // Log every poll_read call at debug level so we can see if it's being called at all.
+        // For the first call after a seek or creation, log at info level.
+        tracing::debug!(
+            stream_id = self.stream_id,
+            file_id = self.file_id,
+            piece_id = current.id.get(),
+            position = self.position,
+            position_mb = self.position / 1024 / 1024,
+            piece_remaining = current.piece_remaining,
+            "poll_read called"
+        );
+
         // if the piece is not there, register to wake when it is
         // check if we have the piece for real
         let have = poll_try_io!(self.torrent.with_chunk_tracker(|ct| {
@@ -396,6 +653,17 @@ impl AsyncRead for FileStream {
             if !have {
                 self.streams
                     .register_waker(self.stream_id, cx.waker().clone());
+                // Log at info level for seek debugging — we need visibility into why
+                // a stream is blocked when the user can see pieces in the bitmap.
+                tracing::debug!(
+                    stream_id = self.stream_id,
+                    file_id = self.file_id,
+                    piece_id = current.id.get(),
+                    position = self.position,
+                    position_mb = self.position / 1024 / 1024,
+                    file_offset = self.file_torrent_abs_offset,
+                    "⏳ STREAM BLOCKED: waiting for piece (not in chunk_tracker)"
+                );
             }
             have
         }));
@@ -465,7 +733,13 @@ impl AsyncSeek for FileStream {
         }
 
         self.as_mut().set_position(map_io_err!(new_pos.try_into())?);
-        debug!(stream_id = self.stream_id, position = self.position, "seek");
+        tracing::debug!(
+            stream_id = self.stream_id,
+            position = self.position,
+            position_mb = self.position / 1024 / 1024,
+            file_id = self.file_id,
+            "🎯 FileStream SEEK to position"
+        );
         Ok(())
     }
 
@@ -479,6 +753,16 @@ impl AsyncSeek for FileStream {
 
 impl Drop for FileStream {
     fn drop(&mut self) {
+        tracing::info!(
+            stream_id = self.stream_id,
+            file_id = self.file_id,
+            position = self.position,
+            position_mb = self.position / 1024 / 1024,
+            file_len_mb = self.file_len / 1024 / 1024,
+            "🗑️ FileStream DROPPED (position={} MB / {} MB)",
+            self.position / 1024 / 1024,
+            self.file_len / 1024 / 1024
+        );
         self.streams.drop_stream(self.stream_id);
     }
 }
@@ -510,6 +794,55 @@ impl ManagedTorrent {
             crate::ManagedTorrentState::Live(l) => Ok(l.streams.clone()),
             s => anyhow::bail!("streams: invalid state {}", s.name()),
         })
+    }
+
+    /// Register or update a streaming anchor for a session.
+    ///
+    /// Call this from the application layer (e.g., on session registration or heartbeat)
+    /// to tell the engine that a user is streaming `file_id` at byte `position`.
+    /// The engine will keep downloading pieces around this position even when
+    /// all HTTP connections (FileStreams) are temporarily closed.
+    ///
+    /// For multi-user: each session_id gets its own anchor, so multiple users
+    /// streaming the same torrent at different positions are all served.
+    pub fn register_streaming_anchor(
+        &self,
+        session_id: &str,
+        file_id: usize,
+        position: u64,
+    ) -> anyhow::Result<()> {
+        let metadata = self
+            .metadata
+            .load_full()
+            .context("torrent metadata is not resolved")?;
+        let fi = metadata
+            .file_infos
+            .get(file_id)
+            .context("invalid file_id for streaming anchor")?;
+        let streams = self.streams()?;
+        streams.register_streaming_anchor(
+            session_id,
+            file_id,
+            position,
+            fi.offset_in_torrent,
+            fi.len,
+        );
+        Ok(())
+    }
+
+    /// Remove a streaming anchor when a session ends or times out.
+    pub fn unregister_streaming_anchor(&self, session_id: &str) -> anyhow::Result<()> {
+        let streams = self.streams()?;
+        streams.unregister_streaming_anchor(session_id);
+        Ok(())
+    }
+
+    /// Subscribe to piece completion events for this torrent.
+    /// Returns a broadcast receiver that yields piece indices as they complete.
+    /// Used by WebSocket handlers to push real-time download progress.
+    pub fn subscribe_piece_completed(&self) -> anyhow::Result<broadcast::Receiver<u32>> {
+        let streams = self.streams()?;
+        Ok(streams.subscribe_piece_completed())
     }
 
     fn maybe_reconnect_needed_peers_for_file(&self, file_id: usize) -> bool {
@@ -572,10 +905,20 @@ impl ManagedTorrent {
                 priority_pieces: None,
                 priority_window_start: None,
                 is_playing: false,
+                last_activity: Instant::now(),
             },
         );
 
         debug!(stream_id = s.stream_id, file_id, "started stream");
+        tracing::debug!(
+            stream_id = s.stream_id,
+            file_id,
+            file_len_mb = fd_len / 1024 / 1024,
+            file_offset = fd_offset,
+            total_streams = streams.streams.len(),
+            "📡 NEW FileStream created (total active: {})",
+            streams.streams.len()
+        );
 
         Ok(s)
     }
@@ -604,12 +947,29 @@ impl FileStream {
         if let Some(mut state) = self.streams.streams.get_mut(&self.stream_id) {
             let state = state.value_mut();
             state.position = new_pos;
+            state.last_activity = Instant::now();
             
             // Check if we need to update the rolling priority window
             let should_update = match state.priority_window_start {
                 Some(window_start) => {
-                    // Update when we've consumed THRESHOLD pieces past the window start
-                    current_piece >= window_start + PRIORITY_UPDATE_THRESHOLD_PIECES
+                    if current_piece < window_start {
+                        true
+                    } else {
+                        // Find the end of the current priority window
+                        let window_end = state.priority_pieces.as_ref()
+                            .and_then(|p| p.last())
+                            .map(|p| p.get())
+                            .unwrap_or(window_start);
+                        
+                        // If we are getting close to the end of the priority window, roll it forward.
+                        // "Close" means less than PRIORITY_UPDATE_THRESHOLD_PIECES left.
+                        if current_piece > window_end {
+                            true
+                        } else {
+                            let pieces_left = window_end.saturating_sub(current_piece);
+                            pieces_left < PRIORITY_UPDATE_THRESHOLD_PIECES
+                        }
+                    }
                 }
                 None => {
                     // No priority window set yet - this stream isn't using rolling priority
@@ -620,8 +980,11 @@ impl FileStream {
             
             if should_update {
                 // Mark as playing once we've advanced past the first few pieces
-                if current_piece >= COLD_START_PRIORITY_PIECES {
-                    state.is_playing = true;
+                // We need to check relative to the window start, not absolute piece 0
+                if let Some(window_start) = state.priority_window_start {
+                    if current_piece >= window_start + COLD_START_PRIORITY_PIECES {
+                        state.is_playing = true;
+                    }
                 }
                 
                 // Calculate new priority window
@@ -643,17 +1006,24 @@ impl FileStream {
                 if !new_priority.is_empty() {
                     let first = new_priority.first().map(|p| p.get()).unwrap_or(0);
                     let last = new_priority.last().map(|p| p.get()).unwrap_or(0);
-                    debug!(
-                        stream_id = self.stream_id,
-                        current_piece,
-                        window_start = first,
-                        window_end = last,
-                        window_size = new_priority.len(),
-                        is_playing = state.is_playing,
-                        "rolling priority window forward"
-                    );
-                    state.priority_window_start = Some(current_piece);
-                    state.priority_pieces = Some(new_priority);
+                    
+                    // Only update & log if the window actually changed
+                    let window_changed = state.priority_window_start != Some(current_piece)
+                        || state.priority_pieces.as_ref().map(|p| p.len()) != Some(new_priority.len());
+                    
+                    if window_changed {
+                        tracing::info!(
+                            stream_id = self.stream_id,
+                            current_piece,
+                            window_start = first,
+                            window_end = last,
+                            window_size = new_priority.len(),
+                            is_playing = state.is_playing,
+                            "rolling priority window forward"
+                        );
+                        state.priority_window_start = Some(current_piece);
+                        state.priority_pieces = Some(new_priority);
+                    }
                 }
             }
         }
@@ -670,13 +1040,45 @@ impl FileStream {
         
         if let Some(mut state) = self.streams.streams.get_mut(&self.stream_id) {
             let state = state.value_mut();
+            
+            // If priority pieces were already set (e.g. by OpenPVR for a seek),
+            // don't overwrite them. Just anchor the rolling window to the first piece.
+            if let Some(ref p) = state.priority_pieces {
+                if let Some(first_piece) = p.first() {
+                    state.priority_window_start = Some(first_piece.get());
+                    state.is_playing = false;
+                    tracing::info!(
+                        stream_id = self.stream_id,
+                        current_piece,
+                        window_start = first_piece.get(),
+                        "enabled rolling priority (anchored to existing priority pieces)"
+                    );
+                    return;
+                }
+            }
+            
             state.priority_window_start = Some(current_piece);
             state.is_playing = false; // Will become true after advancing past cold start
             
-            debug!(
+            // Calculate initial priority window
+            let window_size = COLD_START_PRIORITY_PIECES;
+            let mut new_priority: Vec<ValidPieceIndex> = Vec::with_capacity(window_size as usize);
+            
+            for i in 0..window_size {
+                let piece_id = current_piece + i;
+                if let Some(valid_piece) = lengths.validate_piece_index(piece_id) {
+                    new_priority.push(valid_piece);
+                }
+            }
+            
+            if !new_priority.is_empty() {
+                state.priority_pieces = Some(new_priority);
+            }
+            
+            tracing::info!(
                 stream_id = self.stream_id,
                 current_piece,
-                "enabled rolling priority"
+                "enabled rolling priority (created new window)"
             );
         }
     }

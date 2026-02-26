@@ -1427,10 +1427,29 @@ impl PeerHandler {
                             }
                             !have && !inflight
                         });
-                    let natural_order_pieces = chunk_tracker
-                        .iter_queued_pieces(&g.file_priorities, &self.state.metadata.file_infos);
+                    // When streaming, the priority + lookahead pieces from
+                    // iter_next_pieces already cover everything the user needs.
+                    // Falling through to natural_order_pieces would download
+                    // sequential pieces from piece 0 which is never useful
+                    // while the user is watching at a completely different
+                    // position. Only chain natural_order when NOT streaming.
+                    // Use has_streaming_context() instead of stream_count() > 0
+                    // so that even when all browser connections are briefly closed,
+                    // we continue using the ghost position from iter_next_pieces
+                    // rather than reverting to piece 0.
+                    let is_streaming = self.state.streams.has_streaming_context();
+
+                    let natural_order_pieces: Box<dyn Iterator<Item = ValidPieceIndex>> = if is_streaming {
+                        Box::new(std::iter::empty())
+                    } else {
+                        Box::new(
+                            chunk_tracker
+                                .iter_queued_pieces(&g.file_priorities, &self.state.metadata.file_infos)
+                        )
+                    };
+
                     for n in priority_streamed_pieces.chain(natural_order_pieces) {
-                        if bf.get(n.get() as usize).map(|v| *v) == Some(true) {
+                        if bf.get(n.get() as usize).as_deref() == Some(&true) {
                             n_opt = Some(n);
                             break;
                         }
