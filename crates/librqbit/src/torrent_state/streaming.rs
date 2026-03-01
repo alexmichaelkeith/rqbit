@@ -15,7 +15,7 @@ use dashmap::DashMap;
 use librqbit_core::lengths::{CurrentPiece, Lengths, ValidPieceIndex};
 use tokio::{
     io::{AsyncRead, AsyncSeek},
-    sync::{OwnedSemaphorePermit, broadcast},
+    sync::{Notify, OwnedSemaphorePermit, broadcast},
 };
 use tracing::{debug, trace};
 
@@ -25,11 +25,25 @@ use super::{ManagedTorrentHandle, TorrentMetadata};
 
 type StreamId = usize;
 
-// 512 MB lookahead by default. With 16MB pieces, this covers ~32 pieces ahead
-// of the current read position as "normal" (non-priority) lookahead. This prevents
-// the download loop from falling through to natural_order_pieces (sequential from 
-// position 0) when the priority window is exhausted.
-const PER_STREAM_BUF_DEFAULT: u64 = 512 * 1024 * 1024;
+// Normal (non-priority) lookahead buffer. Pieces in this window are downloaded
+// when no priority pieces remain, preventing fallback to natural_order_pieces
+// (sequential from piece 0). Kept small so we don't over-download ahead of the
+// user's actual playback position.
+//
+// IMPORTANT: The EFFECTIVE lookahead is capped to MAX_LOOKAHEAD_PIECES below,
+// so this byte value only matters for torrents with very large pieces (≥16 MB).
+// For typical 4 MB pieces the piece cap dominates.
+const PER_STREAM_BUF_DEFAULT: u64 = 128 * 1024 * 1024; // 128 MB
+
+// Maximum number of lookahead pieces regardless of byte budget.
+// Without this, small-piece torrents (4 MB) would generate 128 pieces from
+// PER_STREAM_BUF_DEFAULT alone — far more than needed for smooth playback.
+// 20 pieces × 4 MB = 80 MB ≈ 15-20 seconds of 4K content at 40 Mbps.
+const MAX_LOOKAHEAD_PIECES: usize = 20;
+
+// Ensure we always download at least this many bytes ahead, even for torrents
+// with very small pieces (e.g., 256KB pieces would need 60 pieces to hit 15MB).
+const MIN_LOOKAHEAD_BYTES: u64 = 15 * 1024 * 1024; // 15 MB
 
 // Rolling priority window size (number of pieces ahead to prioritize)
 const COLD_START_PRIORITY_PIECES: u32 = 6;  // Smaller window for fast cold start
@@ -71,8 +85,13 @@ impl StreamState {
         let dpl = lengths.default_piece_length();
         let start_id = (start / dpl as u64).try_into().unwrap();
         let end_id = end.div_ceil(dpl as u64).try_into().unwrap();
+        
+        let piece_limit = MAX_LOOKAHEAD_PIECES
+            .max(MIN_LOOKAHEAD_BYTES.div_ceil(dpl as u64) as usize);
+            
         let normal_pieces: Vec<_> = (start_id..end_id)
             .filter_map(|i| lengths.validate_piece_index(i))
+            .take(piece_limit)
             .collect();
         normal_pieces.into_iter()
     }
@@ -109,6 +128,10 @@ pub(crate) struct TorrentStreams {
     /// WebSocket handlers subscribe to this to push real-time piece progress
     /// to connected clients without polling.
     piece_completed_tx: broadcast::Sender<u32>,
+    /// Notify idle peer download loops that new priority pieces are available.
+    /// Shared with TorrentStateLive so peers wake immediately on priority change
+    /// instead of sleeping for up to 5 seconds.
+    pub(crate) new_pieces_notify: Notify,
 }
 
 impl Default for TorrentStreams {
@@ -119,6 +142,7 @@ impl Default for TorrentStreams {
             streams: DashMap::new(),
             anchors: DashMap::new(),
             piece_completed_tx: tx,
+            new_pieces_notify: Notify::new(),
         }
     }
 }
@@ -341,8 +365,13 @@ impl TorrentStreams {
                     let dpl = lengths.default_piece_length();
                     let start_id = (start / dpl as u64).try_into().unwrap();
                     let end_id = end.div_ceil(dpl as u64).try_into().unwrap();
+                    
+                    let piece_limit = MAX_LOOKAHEAD_PIECES
+                        .max(MIN_LOOKAHEAD_BYTES.div_ceil(dpl as u64) as usize);
+                        
                     let pieces: Vec<_> = (start_id..end_id)
                         .filter_map(|i| lengths.validate_piece_index(i))
+                        .take(piece_limit)
                         .collect();
                     pieces.into_iter()
                 })
@@ -510,6 +539,9 @@ impl TorrentStreams {
                 if let Some(first_piece) = p.first() {
                     state.priority_window_start = Some(first_piece.get());
                 }
+                // Wake all idle peer download loops so they pick up the new
+                // priority pieces immediately instead of sleeping up to 5s.
+                self.new_pieces_notify.notify_waiters();
             }
         } else {
             debug!(
@@ -944,6 +976,7 @@ impl FileStream {
         let current_piece = (abs_pos / piece_len) as u32;
         
         // Update stream state and check if we need to roll the priority window
+        let mut priority_changed = false;
         if let Some(mut state) = self.streams.streams.get_mut(&self.stream_id) {
             let state = state.value_mut();
             state.position = new_pos;
@@ -1023,9 +1056,15 @@ impl FileStream {
                         );
                         state.priority_window_start = Some(current_piece);
                         state.priority_pieces = Some(new_priority);
+                        priority_changed = true;
                     }
                 }
             }
+        }
+        // Wake idle peers AFTER releasing the DashMap guard so we don't
+        // hold a write lock while peers try to read priority pieces.
+        if priority_changed {
+            self.streams.new_pieces_notify.notify_waiters();
         }
     }
     

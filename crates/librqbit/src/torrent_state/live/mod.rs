@@ -200,7 +200,6 @@ pub struct TorrentStateLive {
     peer_queue_tx: UnboundedSender<SocketAddr>,
 
     finished_notify: Notify,
-    new_pieces_notify: Notify,
 
     down_speed_estimator: SpeedEstimator,
     up_speed_estimator: SpeedEstimator,
@@ -285,7 +284,6 @@ impl TorrentStateLive {
             peer_semaphore: Arc::new(Semaphore::new(
                 paused.shared.options.peer_limit.unwrap_or(128),
             )),
-            new_pieces_notify: Notify::new(),
             peer_queue_tx,
             finished_notify: Notify::new(),
             down_speed_estimator,
@@ -1280,7 +1278,7 @@ impl PeerHandler {
                     );
                     g.get_chunks_mut()?
                         .mark_piece_broken_if_not_have(req.piece_index);
-                    self.state.new_pieces_notify.notify_waiters();
+                    self.state.streams.new_pieces_notify.notify_waiters();
                 }
             }
             PeerState::NotNeeded => {
@@ -1887,7 +1885,7 @@ impl PeerHandler {
             // Then try steal from very slow peers (10x threshold).
             // Then try get the next one in queue.
             // Afterwards means we are close to completion, try stealing more aggressively.
-            let new_piece_notify = self.state.new_pieces_notify.notified();
+            let new_piece_notify = self.state.streams.new_pieces_notify.notified();
             let next = match self
                 .try_steal_priority_piece(Duration::from_millis(2000))
                 .or_else(|| self.try_steal_old_slow_piece(10.))
@@ -2211,7 +2209,7 @@ impl PeerHandler {
                         .lock_write("mark_piece_broken")
                         .get_chunks_mut()?
                         .mark_piece_broken_if_not_have(chunk_info.piece_index);
-                    state.new_pieces_notify.notify_waiters();
+                    state.streams.new_pieces_notify.notify_waiters();
                     anyhow::bail!("i am probably a bogus peer. dying.")
                 }
             };
