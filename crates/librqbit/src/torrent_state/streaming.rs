@@ -3,7 +3,7 @@ use std::{
     io::SeekFrom,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Poll, Waker},
     time::Instant,
@@ -132,6 +132,10 @@ pub(crate) struct TorrentStreams {
     /// Shared with TorrentStateLive so peers wake immediately on priority change
     /// instead of sleeping for up to 5 seconds.
     pub(crate) new_pieces_notify: Notify,
+    /// When true, natural_order_pieces (sequential download) is enabled even
+    /// while streaming context exists.  Streaming pieces are still prioritised,
+    /// but idle bandwidth fills in remaining pieces in the background.
+    background_download: AtomicBool,
 }
 
 impl Default for TorrentStreams {
@@ -143,6 +147,7 @@ impl Default for TorrentStreams {
             anchors: DashMap::new(),
             piece_completed_tx: tx,
             new_pieces_notify: Notify::new(),
+            background_download: AtomicBool::new(false),
         }
     }
 }
@@ -166,6 +171,22 @@ impl TorrentStreams {
         }
         // Check if we have any active anchors (registered by the application layer)
         !self.anchors.is_empty()
+    }
+
+    /// Enable background downloading of all pieces while streaming.
+    /// When set, the download loop chains natural_order_pieces after
+    /// streaming priority pieces so idle bandwidth fills in the rest.
+    pub fn set_background_download(&self, enabled: bool) {
+        self.background_download.store(enabled, Ordering::Relaxed);
+        if enabled {
+            // Wake peers so they pick up natural_order pieces immediately
+            self.new_pieces_notify.notify_waiters();
+        }
+    }
+
+    /// Whether background download mode is active.
+    pub fn background_download_enabled(&self) -> bool {
+        self.background_download.load(Ordering::Relaxed)
     }
 
     /// Register or update a streaming anchor for a session.
@@ -216,6 +237,18 @@ impl TorrentStreams {
                 session_id,
                 anchor_count = self.anchors.len(),
                 "unregistered streaming anchor"
+            );
+        }
+    }
+
+    /// Remove ALL streaming anchors (e.g. when background completion takes over).
+    pub fn clear_all_anchors(&self) {
+        let count = self.anchors.len();
+        self.anchors.clear();
+        if count > 0 {
+            tracing::info!(
+                removed = count,
+                "cleared all streaming anchors"
             );
         }
     }
@@ -494,14 +527,29 @@ impl TorrentStreams {
         let removed = self.streams.remove(&stream_id).map(|s| s.1);
         
         if let Some(ref state) = removed {
-            tracing::info!(
-                stream_id,
-                position = state.position,
-                file_abs_offset = state.file_abs_offset,
-                remaining_streams = self.streams.len(),
-                anchor_count = self.anchors.len(),
-                "stream dropped (anchors maintain piece selection context)"
-            );
+            let lost_priority_count = state.priority_pieces.as_ref().map(|p| p.len()).unwrap_or(0);
+            let lost_ids: Vec<u32> = state.priority_pieces.as_ref()
+                .map(|p| p.iter().take(10).map(|x| x.get()).collect())
+                .unwrap_or_default();
+            if lost_priority_count > 0 {
+                tracing::warn!(
+                    stream_id,
+                    lost_priority_count,
+                    ?lost_ids,
+                    remaining_streams = self.streams.len(),
+                    "⚠️ STREAM DROP: {} priority pieces LOST with this stream!",
+                    lost_priority_count
+                );
+            } else {
+                tracing::info!(
+                    stream_id,
+                    position = state.position,
+                    file_abs_offset = state.file_abs_offset,
+                    remaining_streams = self.streams.len(),
+                    anchor_count = self.anchors.len(),
+                    "stream dropped (no priority pieces lost)"
+                );
+            }
         }
         
         removed
@@ -556,10 +604,24 @@ impl TorrentStreams {
     /// by have/inflight status.
     pub fn get_all_priority_pieces(&self) -> Vec<ValidPieceIndex> {
         let mut all_priority: Vec<ValidPieceIndex> = Vec::new();
+        let stream_count = self.streams.len();
+        let mut streams_with_priority = 0;
         for entry in self.streams.iter() {
             if let Some(ref pieces) = entry.value().priority_pieces {
+                streams_with_priority += 1;
                 all_priority.extend(pieces.iter().cloned());
             }
+        }
+        // Diagnostic: log when priority pieces exist, so we can confirm they survive stream drops
+        if !all_priority.is_empty() {
+            let ids: Vec<u32> = all_priority.iter().take(15).map(|p| p.get()).collect();
+            debug!(
+                stream_count,
+                streams_with_priority,
+                total_priority = all_priority.len(),
+                ?ids,
+                "get_all_priority_pieces"
+            );
         }
         all_priority
     }
@@ -828,6 +890,40 @@ impl ManagedTorrent {
         })
     }
 
+    /// Set priority pieces on a specific stream by ID.
+    ///
+    /// This allows callers (e.g. background expansion tasks) to update the
+    /// priority on the main playback stream without needing to hold a
+    /// `FileStream` reference. The priority persists as long as the stream
+    /// is alive — it is NOT lost when the caller's scope ends.
+    pub fn set_priority_for_stream(
+        &self,
+        stream_id: usize,
+        pieces: Option<Vec<ValidPieceIndex>>,
+    ) -> anyhow::Result<()> {
+        let streams = self.streams()?;
+        streams.set_stream_priority(stream_id, pieces);
+        Ok(())
+    }
+
+    /// Enable rolling priority on a specific stream by ID.
+    ///
+    /// Like `set_priority_for_stream`, this allows background tasks to enable
+    /// rolling priority on the main playback stream without holding a FileStream.
+    pub fn enable_rolling_priority_for_stream(
+        &self,
+        stream_id: usize,
+    ) -> anyhow::Result<()> {
+        let streams = self.streams()?;
+        // Get the current piece position to anchor the rolling window.
+        if let Some(s) = streams.streams.get(&stream_id) {
+            let window_start = s.value().priority_window_start.unwrap_or(0);
+            drop(s);
+            streams.enable_rolling_priority(stream_id, window_start, &self.metadata.load_full().context("metadata not loaded")?.lengths());
+        }
+        Ok(())
+    }
+
     /// Register or update a streaming anchor for a session.
     ///
     /// Call this from the application layer (e.g., on session registration or heartbeat)
@@ -866,6 +962,24 @@ impl ManagedTorrent {
     pub fn unregister_streaming_anchor(&self, session_id: &str) -> anyhow::Result<()> {
         let streams = self.streams()?;
         streams.unregister_streaming_anchor(session_id);
+        Ok(())
+    }
+
+    /// Remove ALL streaming anchors for this torrent.
+    /// Used when background completion takes over so librqbit's natural
+    /// sequential download can proceed unblocked.
+    pub fn clear_all_streaming_anchors(&self) -> anyhow::Result<()> {
+        let streams = self.streams()?;
+        streams.clear_all_anchors();
+        Ok(())
+    }
+
+    /// Enable or disable background downloading for this torrent.
+    /// When enabled, librqbit will download ALL pieces sequentially
+    /// alongside any active streaming priority pieces.
+    pub fn set_background_download(&self, enabled: bool) -> anyhow::Result<()> {
+        let streams = self.streams()?;
+        streams.set_background_download(enabled);
         Ok(())
     }
 
