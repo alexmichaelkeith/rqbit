@@ -77,6 +77,12 @@ pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 
 pub type TorrentId = usize;
 
+const MAX_PENDING_INCOMING_HANDSHAKES: usize = 64;
+
+fn should_accept_more_incoming_handshake_checks(pending_handshakes: usize) -> bool {
+    pending_handshakes < MAX_PENDING_INCOMING_HANDSHAKES
+}
+
 struct ParsedTorrentFile {
     meta: TorrentMetaV1Owned,
     torrent_bytes: Bytes,
@@ -936,7 +942,7 @@ impl Session {
 
         loop {
             tokio::select! {
-                r = l.accept() => {
+                r = l.accept(), if should_accept_more_incoming_handshake_checks(futs.len()) => {
                     match r {
                         Ok((addr, (read, write))) => {
                             trace!("accepted connection from {addr}");
@@ -1781,7 +1787,10 @@ mod tests {
     use itertools::Itertools;
     use librqbit_core::torrent_metainfo::{TorrentMetaV1, torrent_from_bytes};
 
-    use super::torrent_file_from_info_bytes;
+    use super::{
+        MAX_PENDING_INCOMING_HANDSHAKES, should_accept_more_incoming_handshake_checks,
+        torrent_file_from_info_bytes,
+    };
 
     #[test]
     fn test_torrent_file_from_info_and_bytes() {
@@ -1803,5 +1812,19 @@ mod tests {
         assert_eq!(parsed.info_hash, generated_parsed.info_hash);
         assert_eq!(parsed.info, generated_parsed.info);
         assert_eq!(parsed_trackers, get_trackers(&generated_parsed));
+    }
+
+    #[test]
+    fn test_incoming_handshake_backlog_cap() {
+        assert!(should_accept_more_incoming_handshake_checks(0));
+        assert!(should_accept_more_incoming_handshake_checks(
+            MAX_PENDING_INCOMING_HANDSHAKES - 1
+        ));
+        assert!(!should_accept_more_incoming_handshake_checks(
+            MAX_PENDING_INCOMING_HANDSHAKES
+        ));
+        assert!(!should_accept_more_incoming_handshake_checks(
+            MAX_PENDING_INCOMING_HANDSHAKES + 1
+        ));
     }
 }
