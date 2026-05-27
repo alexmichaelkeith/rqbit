@@ -6,7 +6,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU16, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -68,7 +68,7 @@ use librqbit_utp::BindDevice;
 use parking_lot::RwLock;
 use peer_binary_protocol::Handshake;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
 use tracker_comms::{TrackerComms, UdpTrackerClient};
@@ -114,7 +114,8 @@ pub struct Session {
 
     // Network
     peer_id: Id20,
-    announce_port: Option<u16>,
+    announce_port: AtomicU16,
+    announce_port_tx: watch::Sender<Option<u16>>,
     listen_addr: Option<SocketAddr>,
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
@@ -730,6 +731,9 @@ impl Session {
                 }
             };
 
+            let initial_announce_port = listen_result.as_ref().and_then(|l| l.announce_port);
+            let (announce_port_tx, _) = watch::channel(initial_announce_port);
+
             let session = Arc::new(Self {
                 persistence,
                 bitv_factory,
@@ -742,7 +746,8 @@ impl Session {
                 db: RwLock::new(Default::default()),
                 _cancellation_token_drop_guard: token.clone().drop_guard(),
                 cancellation_token: token,
-                announce_port: listen_result.as_ref().and_then(|l| l.announce_port),
+                announce_port: AtomicU16::new(initial_announce_port.unwrap_or(0)),
+                announce_port_tx,
                 listen_addr: listen_result.as_ref().map(|l| l.addr),
                 disk_write_tx,
                 default_storage_factory: opts.default_storage_factory,
@@ -1490,7 +1495,10 @@ impl Session {
             None
         } else {
             self.dht.as_ref().map(|dht| {
-                dht.get_peers(info_hash, if announce { self.announce_port } else { None })
+                dht.get_peers(
+                    info_hash,
+                    if announce { self.announce_port() } else { None },
+                )
             })
         };
 
@@ -1498,7 +1506,10 @@ impl Session {
             None
         } else {
             self.lsd.as_ref().map(|lsd| {
-                lsd.announce(info_hash, if announce { self.announce_port } else { None })
+                lsd.announce(
+                    info_hash,
+                    if announce { self.announce_port() } else { None },
+                )
             })
         };
 
@@ -1526,7 +1537,7 @@ impl Session {
             trackers.into_iter().collect(),
             Box::new(tracker_rx_stats),
             force_tracker_interval,
-            self.announce_port().unwrap_or(4240),
+            self.announce_port_tx.subscribe(),
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
         );
@@ -1581,7 +1592,16 @@ impl Session {
     }
 
     pub fn announce_port(&self) -> Option<u16> {
+        match self.announce_port.load(Ordering::SeqCst) {
+            0 => None,
+            port => Some(port),
+        }
+    }
+
+    pub fn set_announce_port(&self, announce_port: Option<u16>) {
         self.announce_port
+            .store(announce_port.unwrap_or(0), Ordering::SeqCst);
+        let _ = self.announce_port_tx.send(announce_port);
     }
 
     async fn resolve_magnet(
