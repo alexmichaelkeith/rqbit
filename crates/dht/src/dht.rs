@@ -30,6 +30,7 @@ use leaky_bucket::RateLimiter;
 use librqbit_core::{
     compact_ip::{CompactSerialize, CompactSerializeFixedLen},
     crate_version,
+    dns::HostResolver,
     hash_id::Id20,
     peer_id::generate_azereus_style,
     spawn_utils::{spawn, spawn_with_cancel},
@@ -967,6 +968,7 @@ impl core::fmt::Debug for ResponseOrError {
 struct DhtWorker {
     socket: UdpSocket,
     dht: Arc<DhtState>,
+    resolver: Option<Arc<dyn HostResolver>>,
 }
 
 impl DhtWorker {
@@ -979,10 +981,28 @@ impl DhtWorker {
     }
 
     async fn bootstrap_hostname(&self, hostname: &str) -> crate::Result<()> {
-        let addrs = tokio::net::lookup_host(hostname)
-            .await
-            .map_err(|err| Error::lookup(hostname, err))?
-            .collect::<Vec<_>>();
+        let addrs = match self.resolver.as_deref() {
+            Some(resolver) => {
+                let (host, port) = hostname.rsplit_once(':').ok_or_else(|| {
+                    Error::lookup(
+                        hostname,
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing port"),
+                    )
+                })?;
+                let host = host.trim_start_matches('[').trim_end_matches(']');
+                let port = port
+                    .parse()
+                    .map_err(|err| Error::lookup(hostname, std::io::Error::other(err)))?;
+                resolver
+                    .resolve(host, port)
+                    .await
+                    .map_err(|err| Error::lookup(hostname, std::io::Error::other(err)))?
+            }
+            None => tokio::net::lookup_host(hostname)
+                .await
+                .map_err(|err| Error::lookup(hostname, err))?
+                .collect::<Vec<_>>(),
+        };
         let v4 = RecursiveRequest::find_node_for_routing_table(
             self.dht.clone(),
             self.dht.id,
@@ -1283,6 +1303,7 @@ pub struct DhtConfig<'a> {
     pub peer_store: Option<PeerStore>,
     pub cancellation_token: Option<CancellationToken>,
     pub bind_device: Option<&'a BindDevice>,
+    pub resolver: Option<Arc<dyn HostResolver>>,
 }
 
 impl DhtState {
@@ -1321,6 +1342,7 @@ impl DhtState {
                 .unwrap_or_else(|| crate::DHT_BOOTSTRAP.iter().map(|v| v.to_string()).collect());
 
             let token = config.cancellation_token.take().unwrap_or_default();
+            let resolver = config.resolver.take();
 
             let (in_tx, in_rx) = unbounded_channel();
             let state = Arc::new(Self::new_internal(
@@ -1340,7 +1362,11 @@ impl DhtState {
                 {
                     let state = state.clone();
                     async move {
-                        let worker = DhtWorker { socket, dht: state };
+                        let worker = DhtWorker {
+                            socket,
+                            dht: state,
+                            resolver,
+                        };
                         worker.start(in_rx, &bootstrap_addrs).await
                     }
                 },

@@ -24,6 +24,7 @@ use url::Url;
 use crate::tracker_comms_http;
 use crate::tracker_comms_udp;
 use crate::tracker_comms_udp::UdpTrackerClient;
+use librqbit_core::dns::HostResolver;
 use librqbit_core::hash_id::Id20;
 use tokio::sync::watch;
 
@@ -38,6 +39,7 @@ pub struct TrackerComms {
     tx: Sender,
     announce_port_rx: watch::Receiver<Option<u16>>,
     reqwest_client: reqwest::Client,
+    resolver: Option<Arc<dyn HostResolver>>,
     key: u32,
 }
 
@@ -108,6 +110,7 @@ enum UdpTrackerResolveResult {
 async fn udp_tracker_to_socket_addrs(
     host: url::Host<&str>,
     port: u16,
+    resolver: Option<&dyn HostResolver>,
 ) -> anyhow::Result<UdpTrackerResolveResult> {
     let res = match host {
         url::Host::Domain(name) => {
@@ -115,10 +118,14 @@ async fn udp_tracker_to_socket_addrs(
 
             let mut v4: Option<SocketAddrV4> = None;
             let mut v6: Option<SocketAddrV6> = None;
-            for addr in tokio::net::lookup_host((name, port))
-                .await
-                .with_context(|| format!("error looking up hostname {name}"))?
-            {
+            let addrs = match resolver {
+                Some(resolver) => resolver.resolve(name, port).await?,
+                None => tokio::net::lookup_host((name, port))
+                    .await
+                    .with_context(|| format!("error looking up hostname {name}"))?
+                    .collect(),
+            };
+            for addr in addrs {
                 match (v4, v6, addr) {
                     (None, _, SocketAddr::V4(addr)) => v4 = Some(addr),
                     (_, None, SocketAddr::V6(addr)) => v6 = Some(addr),
@@ -182,6 +189,7 @@ impl TrackerComms {
         announce_port_rx: watch::Receiver<Option<u16>>,
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
+        resolver: Option<Arc<dyn HostResolver>>,
     ) -> Option<BoxStream<'static, SocketAddr>> {
         let trackers = trackers
             .into_iter()
@@ -213,6 +221,7 @@ impl TrackerComms {
                 tx,
                 announce_port_rx,
                 reqwest_client,
+                resolver,
                 key: rand::random(),
             });
             let mut futures = FuturesUnordered::new();
@@ -392,7 +401,7 @@ impl TrackerComms {
 
             // This should retry forever until the addrs are resolved.
             let addrs = (async || {
-                udp_tracker_to_socket_addrs(host.clone(), port)
+                udp_tracker_to_socket_addrs(host.clone(), port, self.resolver.as_deref())
                     .instrument(trace_span!("resolve", ?host))
                     .await
                     .or_else(|err| prev_addrs.ok_or(err))
@@ -493,6 +502,50 @@ impl TrackerComms {
                 debug!(?addr, "error reading announce response: {e:#}");
                 Err(e)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use librqbit_core::dns::{HostResolver, ResolveFuture};
+
+    use super::{UdpTrackerResolveResult, udp_tracker_to_socket_addrs};
+
+    struct TestResolver;
+
+    impl HostResolver for TestResolver {
+        fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolveFuture<'a> {
+            Box::pin(async move {
+                assert_eq!(host, "tracker.invalid");
+                Ok(vec![
+                    (Ipv4Addr::new(192, 0, 2, 7), port).into(),
+                    (Ipv6Addr::LOCALHOST, port).into(),
+                ])
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_tracker_uses_supplied_resolver() {
+        let resolved = udp_tracker_to_socket_addrs(
+            url::Host::Domain("tracker.invalid"),
+            6969,
+            Some(&TestResolver),
+        )
+        .await
+        .unwrap();
+
+        match resolved {
+            UdpTrackerResolveResult::Two(v4, v6) => {
+                assert_eq!(*v4.ip(), Ipv4Addr::new(192, 0, 2, 7));
+                assert_eq!(v4.port(), 6969);
+                assert_eq!(*v6.ip(), Ipv6Addr::LOCALHOST);
+                assert_eq!(v6.port(), 6969);
+            }
+            other => panic!("expected dual-stack result, got {other:?}"),
         }
     }
 }
