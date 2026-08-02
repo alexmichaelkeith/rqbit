@@ -38,7 +38,7 @@ use crate::{
         ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions, ManagedTorrentState,
         TorrentMetadata, TorrentStateLive, initializing::TorrentStateInitializing,
     },
-    type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite, DiskWorkQueueSender, PeerStream},
+    type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite, PeerStream},
 };
 use anyhow::{Context, bail};
 use arc_swap::ArcSwapOption;
@@ -46,7 +46,10 @@ use bencode::bencode_serialize_to_writer;
 use buffers::{ByteBuf, ByteBufOwned};
 use bytes::Bytes;
 use clone_to_owned::CloneToOwned;
-use dht::{Dht, DhtBuilder, DhtConfig, Id20, PersistentDht, PersistentDhtConfig};
+use dht::{
+    Dht, DhtBuilder, DhtConfig, DhtPersistenceConfig, Id20, PersistentDht, PersistentDhtConfig,
+    dht_listen_addr,
+};
 use futures::{
     FutureExt, Stream, StreamExt, TryFutureExt,
     future::BoxFuture,
@@ -55,7 +58,6 @@ use futures::{
 use http::StatusCode;
 use itertools::Itertools;
 use librqbit_core::{
-    constants::CHUNK_SIZE,
     crate_version,
     directories::get_configuration_directory,
     dns::{BoundDnsResolver, HostResolver},
@@ -77,12 +79,6 @@ use tracker_comms::{TrackerComms, UdpTrackerClient};
 pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 
 pub type TorrentId = usize;
-
-const MAX_PENDING_INCOMING_HANDSHAKES: usize = 64;
-
-fn should_accept_more_incoming_handshake_checks(pending_handshakes: usize) -> bool {
-    pending_handshakes < MAX_PENDING_INCOMING_HANDSHAKES
-}
 
 struct ParsedTorrentFile {
     meta: TorrentMetaV1Owned,
@@ -140,7 +136,6 @@ pub struct Session {
     peer_opts: PeerConnectionOptions,
     default_storage_factory: Option<BoxStorageFactory>,
     persistence: Option<Arc<dyn SessionPersistenceStore>>,
-    disk_write_tx: Option<DiskWorkQueueSender>,
     trackers: HashSet<url::Url>,
 
     lsd: Option<LocalServiceDiscovery>,
@@ -161,6 +156,7 @@ pub struct Session {
     _disable_upload: bool,
     pub ipv4_only: bool,
     pub peer_limit: Option<usize>,
+    client_name_and_version: String,
 }
 
 #[derive(Clone)]
@@ -318,10 +314,6 @@ pub struct AddTorrentOptions {
     #[serde(skip)]
     pub storage_factory: Option<BoxStorageFactory>,
 
-    // If true, will write to disk in separate threads. The downside is additional allocations.
-    // May be useful if the disk is slow.
-    pub defer_writes: Option<bool>,
-
     // Custom trackers
     pub trackers: Option<Vec<String>>,
 }
@@ -423,18 +415,44 @@ impl SessionPersistenceConfig {
     }
 }
 
-#[derive(Default)]
+/// Configuration for the DHT subsystem.
+/// Set to `None` in `SessionOptions::dht` to disable DHT entirely.
+pub struct DhtSessionConfig {
+    /// Bootstrap nodes (host:port or ip:port). Uses built-in defaults if None.
+    pub bootstrap_addrs: Option<Vec<String>>,
+    /// The DHT listen port. Priority: this explicit port -> persisted port
+    /// (when persistence is enabled) -> random. The bind IP is derived from
+    /// `SessionOptions::ipv4_only` (`0.0.0.0` if true, `[::]` otherwise).
+    /// Use `SessionOptions::bind_device_name` to scope the bind to a specific
+    /// network interface.
+    pub port: Option<u16>,
+    /// Persistence behavior. If None, persistence is disabled.
+    pub persistence: Option<DhtPersistenceConfig>,
+}
+
+impl Default for DhtSessionConfig {
+    fn default() -> Self {
+        Self {
+            bootstrap_addrs: None,
+            port: None,
+            persistence: Some(DhtPersistenceConfig::default()),
+        }
+    }
+}
+
 pub struct SessionOptions {
-    /// Turn on to disable DHT.
+    /// DHT configuration. Set to None to disable DHT entirely.
+    /// Defaults to DHT enabled with persistence.
+    pub dht: Option<DhtSessionConfig>,
+
+    /// Backwards-compatible switch for callers using the pre-9.0 DHT options.
     pub disable_dht: bool,
-    /// Turn on to disable DHT persistence. By default it will re-use stored DHT
-    /// configuration, including the port it listens on.
-    pub disable_dht_persistence: bool,
-    /// Pass in to configure DHT persistence filename. This can be used to run multiple
-    /// librqbit instances at a time.
-    pub dht_config: Option<PersistentDhtConfig>,
-    /// A list o DHT bootstrap nodes as strings of the form host:port or ip:port
+
+    /// Backwards-compatible bootstrap list for callers using the pre-9.0 DHT options.
     pub dht_bootstrap_addrs: Option<Vec<String>>,
+
+    /// Backwards-compatible persistence settings for callers using the pre-9.0 DHT options.
+    pub dht_config: Option<PersistentDhtConfig>,
 
     /// What network device to bind to for DHT, BT-UDP, BT-TCP, trackers and LSD.
     /// On OSX will use IP(V6)_BOUND_IF, on Linux will use SO_BINDTODEVICE.
@@ -461,10 +479,6 @@ pub struct SessionOptions {
     pub listen: Option<ListenerOptions>,
     /// Options for connecting to peers (for outgiong connections).
     pub connect: Option<ConnectionOptions>,
-
-    // If you set this to something, all writes to disk will happen in background and be
-    // buffered in memory up to approximately the given number of megabytes.
-    pub defer_writes_up_to: Option<usize>,
 
     pub default_storage_factory: Option<BoxStorageFactory>,
 
@@ -499,6 +513,44 @@ pub struct SessionOptions {
 
     /// Force IPv4 only.
     pub ipv4_only: bool,
+
+    /// Override the client name and version used in User-Agent headers and
+    /// peer extended handshakes. Defaults to "rqbit X.Y.Z".
+    pub client_name_and_version: Option<String>,
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self {
+            dht: Some(DhtSessionConfig::default()),
+            disable_dht: false,
+            dht_bootstrap_addrs: None,
+            dht_config: None,
+            bind_device_name: None,
+            dns_server: None,
+            disable_trackers: false,
+            fastresume: false,
+            persistence: None,
+            peer_id: None,
+            listen: None,
+            connect: None,
+            default_storage_factory: None,
+            cancellation_token: None,
+            concurrent_init_limit: None,
+            runtime_worker_threads: None,
+            root_span: None,
+            ratelimits: LimitsConfig::default(),
+            blocklist_url: None,
+            allowlist_url: None,
+            trackers: HashSet::new(),
+            peer_limit: None,
+            #[cfg(feature = "disable-upload")]
+            disable_upload: false,
+            disable_local_service_discovery: false,
+            ipv4_only: false,
+            client_name_and_version: None,
+        }
+    }
 }
 
 fn torrent_file_from_info_bytes(info_bytes: &[u8], trackers: &[url::Url]) -> anyhow::Result<Bytes> {
@@ -547,6 +599,10 @@ impl Session {
 
     pub fn cancellation_token(&self) -> &CancellationToken {
         &self.cancellation_token
+    }
+
+    pub fn client_name_and_version(&self) -> &str {
+        &self.client_name_and_version
     }
 
     /// Create a new session with options.
@@ -603,32 +659,48 @@ impl Session {
                 None
             };
 
-            let dht = if opts.disable_dht {
+            let dht_config = if opts.disable_dht {
                 None
+            } else if opts.dht_config.is_some() || opts.dht_bootstrap_addrs.is_some() {
+                Some(DhtSessionConfig {
+                    bootstrap_addrs: opts.dht_bootstrap_addrs.take(),
+                    port: None,
+                    persistence: opts.dht_config.take().map(Into::into),
+                })
             } else {
-                let dht = if opts.disable_dht_persistence {
-                    DhtBuilder::with_config(DhtConfig {
-                        bootstrap_addrs: opts.dht_bootstrap_addrs.clone(),
-                        cancellation_token: Some(token.child_token()),
-                        bind_device: bind_device.as_ref(),
-                        resolver: resolver.clone(),
-                        ..Default::default()
-                    })
-                    .await
-                    .context("error initializing DHT")?
-                } else {
-                    let pdht_config = opts.dht_config.take().unwrap_or_default();
+                opts.dht.take()
+            };
+
+            let dht = if let Some(dht_config) = dht_config {
+                let dht = if let Some(persistence_config) = dht_config.persistence {
                     PersistentDht::create(
-                        Some(pdht_config),
+                        persistence_config,
+                        dht_config.port,
+                        opts.ipv4_only,
+                        dht_config.bootstrap_addrs,
                         Some(token.clone()),
                         bind_device.as_ref(),
                         resolver.clone(),
                     )
                     .await
                     .context("error initializing persistent DHT")?
+                } else {
+                    let listen_addr = dht_listen_addr(dht_config.port, None, opts.ipv4_only);
+                    DhtBuilder::with_config(DhtConfig {
+                        bootstrap_addrs: dht_config.bootstrap_addrs,
+                        cancellation_token: Some(token.child_token()),
+                        bind_device: bind_device.as_ref(),
+                        resolver: resolver.clone(),
+                        listen_addr: Some(listen_addr),
+                        ..Default::default()
+                    })
+                    .await
+                    .context("error initializing DHT")?
                 };
 
                 Some(dht)
+            } else {
+                None
             };
             let peer_opts = opts
                 .connect
@@ -688,16 +760,6 @@ impl Session {
                 .await
                 .context("error initializing session persistence store")?;
 
-            let (disk_write_tx, disk_write_rx) = opts
-                .defer_writes_up_to
-                .map(|mb| {
-                    const DISK_WRITE_APPROX_WORK_ITEM_SIZE: usize = CHUNK_SIZE as usize + 300;
-                    let count = mb * 1024 * 1024 / DISK_WRITE_APPROX_WORK_ITEM_SIZE;
-                    let (tx, rx) = tokio::sync::mpsc::channel(count);
-                    (Some(tx), Some(rx))
-                })
-                .unwrap_or_default();
-
             let proxy_url = opts.connect.as_ref().and_then(|s| s.proxy_url.as_ref());
             if bind_device.is_some() && proxy_url.is_some() {
                 bail!("SOCKS proxy cannot be combined with a bound network device");
@@ -709,6 +771,10 @@ impl Session {
                 ),
                 None => None,
             };
+
+            let client_name_and_version = opts
+                .client_name_and_version
+                .unwrap_or_else(|| crate::client_name_and_version().to_owned());
 
             let reqwest_client = {
                 let builder = if let Some(proxy_url) = proxy_url {
@@ -730,7 +796,10 @@ impl Session {
                     b
                 };
 
-                builder.build().context("error building HTTP(S) client")?
+                builder
+                    .user_agent(&client_name_and_version)
+                    .build()
+                    .context("error building HTTP(S) client")?
             };
 
             let stream_connector = Arc::new(
@@ -804,7 +873,6 @@ impl Session {
                 announce_port: AtomicU16::new(initial_announce_port.unwrap_or(0)),
                 announce_port_tx,
                 listen_addr: listen_result.as_ref().map(|l| l.addr),
-                disk_write_tx,
                 default_storage_factory: opts.default_storage_factory,
                 reqwest_client,
                 resolver,
@@ -820,6 +888,7 @@ impl Session {
                 trackers: opts.trackers,
                 disable_trackers: opts.disable_trackers,
                 peer_limit: opts.peer_limit,
+                client_name_and_version,
 
                 #[cfg(feature = "disable-upload")]
                 _disable_upload: opts.disable_upload,
@@ -828,38 +897,34 @@ impl Session {
                 lsd,
             });
 
-            if let Some(mut disk_write_rx) = disk_write_rx {
-                session.spawn(
-                    debug_span!(parent: session.rs(), "disk_writer"),
-                    "disk_writer",
-                    async move {
-                        while let Some(work) = disk_write_rx.recv().await {
-                            trace!(disk_write_rx_queue_len = disk_write_rx.len());
-                            spawner.block_in_place_with_semaphore(work).await;
-                        }
-                        Ok(())
-                    },
-                );
-            }
-
             if let Some(mut listen) = listen_result {
                 if let Some(tcp) = listen.tcp_socket.take() {
+                    let max_pending_incoming_handshake_checks =
+                        listen.max_pending_incoming_handshake_checks;
                     session.spawn(
                         debug_span!(parent: session.rs(), "tcp_listen", addr = ?listen.addr),
                         "tcp_listen",
                         {
                             let this = session.clone();
-                            async move { this.task_listener(tcp).await }
+                            async move {
+                                this.task_listener(tcp, max_pending_incoming_handshake_checks)
+                                    .await
+                            }
                         },
                     );
                 }
                 if let Some(utp) = listen.utp_socket.take() {
+                    let max_pending_incoming_handshake_checks =
+                        listen.max_pending_incoming_handshake_checks;
                     session.spawn(
                         debug_span!(parent: session.rs(), "utp_listen", addr = ?listen.addr),
                         "utp_listen",
                         {
                             let this = session.clone();
-                            async move { this.task_listener(utp).await }
+                            async move {
+                                this.task_listener(utp, max_pending_incoming_handshake_checks)
+                                    .await
+                            }
                         },
                     );
                 }
@@ -985,14 +1050,18 @@ impl Session {
         ))
     }
 
-    async fn task_listener<A: Accept>(self: Arc<Self>, l: A) -> anyhow::Result<()> {
+    async fn task_listener<A: Accept>(
+        self: Arc<Self>,
+        l: A,
+        max_pending_incoming_handshake_checks: usize,
+    ) -> anyhow::Result<()> {
         let mut futs = FuturesUnordered::new();
         let session = Arc::downgrade(&self);
         drop(self);
 
         loop {
             tokio::select! {
-                r = l.accept(), if should_accept_more_incoming_handshake_checks(futs.len()) => {
+                r = l.accept(), if futs.len() < max_pending_incoming_handshake_checks => {
                     match r {
                         Ok((addr, (read, write))) => {
                             trace!("accepted connection from {addr}");
@@ -1017,8 +1086,9 @@ impl Session {
                     }
                 },
                 Some(Ok((live, checked))) = futs.next(), if !futs.is_empty() => {
+                    let (addr, kind) = (checked.addr, checked.kind);
                     if let Err(e) = live.add_incoming_peer(checked) {
-                        warn!("error handing over incoming connection: {e:#}");
+                        warn!(?addr, ?kind, "error handing over incoming connection: {e:#}");
                     }
                 },
             }
@@ -1365,7 +1435,6 @@ impl Session {
                     peer_read_write_timeout: peer_opts.read_write_timeout,
                     allow_overwrite: opts.overwrite,
                     output_folder,
-                    disk_write_queue: self.disk_write_tx.clone(),
                     ratelimits: opts.ratelimits,
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
@@ -1375,6 +1444,7 @@ impl Session {
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),
                 magnet_name: name,
+                client_name_and_version: self.client_name_and_version.clone(),
             });
 
             let initializing = Arc::new(TorrentStateInitializing::new(
@@ -1675,6 +1745,7 @@ impl Session {
             peer_rx,
             Some(self.merge_peer_opts(peer_opts)),
             self.connector.clone(),
+            self.client_name_and_version.clone(),
         )
         .await
         {
@@ -1823,7 +1894,7 @@ impl tracker_comms::TorrentStatsProvider for PeerRxTorrentInfo {
             total_bytes: stats.total_bytes,
             uploaded_bytes: stats.uploaded_bytes,
             torrent_state: match stats.state {
-                TS::Initializing => S::Initializing,
+                TS::Initializing { .. } => S::Initializing,
                 TS::Live => S::Live,
                 TS::Paused => S::Paused,
                 TS::Error => S::None,
@@ -1840,10 +1911,7 @@ mod tests {
     use itertools::Itertools;
     use librqbit_core::torrent_metainfo::{TorrentMetaV1, torrent_from_bytes};
 
-    use super::{
-        MAX_PENDING_INCOMING_HANDSHAKES, Session, SessionOptions,
-        should_accept_more_incoming_handshake_checks, torrent_file_from_info_bytes,
-    };
+    use super::{Session, SessionOptions, torrent_file_from_info_bytes};
 
     #[tokio::test]
     async fn bound_session_requires_dns_server() {
@@ -1883,19 +1951,5 @@ mod tests {
         assert_eq!(parsed.info_hash, generated_parsed.info_hash);
         assert_eq!(parsed.info, generated_parsed.info);
         assert_eq!(parsed_trackers, get_trackers(&generated_parsed));
-    }
-
-    #[test]
-    fn test_incoming_handshake_backlog_cap() {
-        assert!(should_accept_more_incoming_handshake_checks(0));
-        assert!(should_accept_more_incoming_handshake_checks(
-            MAX_PENDING_INCOMING_HANDSHAKES - 1
-        ));
-        assert!(!should_accept_more_incoming_handshake_checks(
-            MAX_PENDING_INCOMING_HANDSHAKES
-        ));
-        assert!(!should_accept_more_incoming_handshake_checks(
-            MAX_PENDING_INCOMING_HANDSHAKES + 1
-        ));
     }
 }

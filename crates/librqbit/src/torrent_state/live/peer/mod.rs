@@ -2,12 +2,16 @@ pub mod stats;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, atomic::Ordering};
 
 use librqbit_core::hash_id::Id20;
-use librqbit_core::lengths::ChunkInfo;
+use librqbit_core::lengths::{ChunkInfo, ValidPieceIndex};
+use peer_binary_protocol::{Message, Request};
 
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::{
+    Notify,
+    mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+};
 use tracing::debug;
 
 use crate::peer_connection::WriterRequest;
@@ -123,6 +127,12 @@ impl PeerState {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum IncomingConnectionResult {
+    #[error("peer already active")]
+    AlreadyActive,
+}
+
 impl Peer {
     pub fn get_state(&self) -> &PeerState {
         &self.state
@@ -196,9 +206,9 @@ impl Peer {
         tx: PeerTx,
         counters: &PeerStates,
         connection_kind: ConnectionKind,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), IncomingConnectionResult> {
         if matches!(&self.state, PeerState::Connecting(..) | PeerState::Live(..)) {
-            anyhow::bail!("peer already active");
+            return Err(IncomingConnectionResult::AlreadyActive);
         }
         match self.take_state(counters) {
             PeerState::Queued | PeerState::Dead | PeerState::NotNeeded => {
@@ -243,13 +253,22 @@ pub(crate) struct LivePeerState {
     #[allow(dead_code)]
     peer_id: Id20,
 
+    pub client_name: Option<String>,
+
     pub peer_interested: bool,
 
     // This is used to track the pieces the peer has.
     pub bitfield: BF,
 
     // When the peer sends us data this is used to track if we asked for it.
-    pub inflight_requests: HashSet<InflightRequest>,
+    inflight_requests: HashSet<InflightRequest>,
+
+    // Bounded tolerance for chunks that arrive after we cancel requests.
+    // This is intentionally approximate: we track a count instead of storing every
+    // canceled chunk, so a peer is not disconnected for racing our cancel messages.
+    late_cancelled_request_tolerance: u32,
+
+    request_slots_changed: Arc<Notify>,
 
     // The main channel to send requests to peer.
     pub tx: PeerTx,
@@ -266,9 +285,12 @@ impl LivePeerState {
     ) -> Self {
         LivePeerState {
             peer_id,
+            client_name: None,
             peer_interested: initial_interested,
             bitfield: BF::default(),
             inflight_requests: Default::default(),
+            late_cancelled_request_tolerance: 0,
+            request_slots_changed: Default::default(),
             tx,
             connection_kind,
         }
@@ -277,4 +299,69 @@ impl LivePeerState {
     pub fn has_full_torrent(&self, total_pieces: usize) -> bool {
         self.bitfield.get(0..total_pieces).is_some_and(|s| s.all())
     }
+
+    pub fn request_slots_changed(&self) -> Arc<Notify> {
+        self.request_slots_changed.clone()
+    }
+
+    pub fn requested_inflight_count(&self) -> usize {
+        self.inflight_requests.len()
+    }
+
+    pub fn add_inflight_request(&mut self, chunk: ChunkInfo) -> bool {
+        self.inflight_requests.insert(chunk)
+    }
+
+    pub fn remove_inflight_request(&mut self, chunk: &ChunkInfo) -> RemoveInflightRequestResult {
+        if self.inflight_requests.remove(chunk) {
+            self.request_slots_changed.notify_waiters();
+            return RemoveInflightRequestResult::Expected;
+        }
+
+        if self.late_cancelled_request_tolerance > 0 {
+            // This may be any unexpected chunk, not necessarily the exact canceled
+            // one, but the tolerance is bounded by cancels we sent.
+            self.late_cancelled_request_tolerance -= 1;
+            RemoveInflightRequestResult::LateCanceled
+        } else {
+            RemoveInflightRequestResult::Unexpected
+        }
+    }
+
+    pub fn cancel_inflight_requests_for_piece(&mut self, piece: ValidPieceIndex) {
+        let tx = &self.tx;
+        let late_cancelled_request_tolerance = &mut self.late_cancelled_request_tolerance;
+        let before = self.inflight_requests.len();
+        self.inflight_requests.retain(|req| {
+            if req.piece_index == piece {
+                let _ = tx.send(WriterRequest::Message(Message::Cancel(Request {
+                    index: piece.get(),
+                    begin: req.offset,
+                    length: req.size,
+                })));
+                *late_cancelled_request_tolerance += 1;
+                false
+            } else {
+                true
+            }
+        });
+
+        if self.inflight_requests.len() != before {
+            self.request_slots_changed.notify_waiters();
+        }
+    }
+
+    pub fn inflight_requests(&self) -> impl Iterator<Item = &InflightRequest> {
+        self.inflight_requests.iter()
+    }
+
+    pub fn inflight_requests_debug(&self) -> &HashSet<InflightRequest> {
+        &self.inflight_requests
+    }
+}
+
+pub(crate) enum RemoveInflightRequestResult {
+    Expected,
+    LateCanceled,
+    Unexpected,
 }

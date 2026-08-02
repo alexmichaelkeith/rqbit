@@ -9,7 +9,7 @@ use tracing::{debug, trace};
 use crate::{
     bitv::{BitV, BoxBitV},
     file_info::FileInfo,
-    type_aliases::{BF, BS, FileInfos, FilePriorities},
+    type_aliases::{BF, BS, FileInfos},
 };
 
 pub struct ChunkTracker {
@@ -235,7 +235,7 @@ impl ChunkTracker {
 
     pub(crate) fn iter_queued_pieces<'a>(
         &'a self,
-        file_priorities: &'a FilePriorities,
+        file_priorities: &'a [usize],
         file_infos: &'a FileInfos,
     ) -> impl Iterator<Item = ValidPieceIndex> + 'a {
         file_priorities

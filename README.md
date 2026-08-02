@@ -24,7 +24,9 @@ Assuming you are downloading to ~/Downloads. By default it'll download to curren
 
 ## Web UI
 
-Access with http://localhost:3030/web/. It looks similar to the Desktop app, see screenshot below.
+Access at http://localhost:3030/web/. See screenshot below (torrent names and speeds are simulated).
+
+<img width="1000" src="https://github.com/user-attachments/assets/d916b3d9-ebbd-462a-889d-df3916cc2681" />
 
 ## Desktop app
 
@@ -34,7 +36,7 @@ Download it in [Releases](https://github.com/ikatson/rqbit/releases) for OSX and
 
     cargo tauri build
 
-<img width="1136" alt="Rqbit desktop" src="https://github.com/ikatson/rqbit/assets/221386/51f56542-667f-4f5e-a1e0-942b1df4cd5a">
+It looks similar to the Web UI (screenshot above).
 
 ## Streaming support
 
@@ -51,6 +53,16 @@ Usage from CLI
 
 ```
 rqbit --enable-upnp-server server start ...
+```
+
+## mDNS advertising
+
+rqbit can advertise its HTTP API on your LAN via mDNS/DNS-SD, so you can open the Web UI at http://rqbit.local:3030/web/ from any device without knowing the server's IP.
+
+Usage from CLI (requires a non-loopback listen address):
+
+```
+rqbit --enable-mdns --http-api-listen-addr 0.0.0.0:3030 server start ...
 ```
 
 ## IPv6
@@ -76,6 +88,10 @@ rqbit --socks-url socks5://[username:password]@host:port ...
 ```
 rqbit server start --watch-folder [path] /download/path
 ```
+
+## Systemd socket activation
+
+rqbit can be started on-demand via [systemd socket activation](https://0pointer.de/blog/projects/socket-activation.html) by installing the [service and socket systemd units](systemd) into `$XDG_CONFIG_HOME/systemd/user/` (`~/.config/systemd/user`) and customizing them to your needs. If the associated [`rqbit.conf`](systemd/rqbit.conf) file is installed in `$XDG_CONFIG_HOME/rqbit/rqbit.conf` (`~/.config/rqbit/rqbit.conf`), it will be used to configure `rqbit` when started via the provided systemd unit.
 
 ## Performance
 
@@ -171,6 +187,7 @@ Use a regex here to select files by their names.
 - Streaming, with seeking
 - UPNP port forwarding to your router
 - UPNP Media Server
+- mDNS advertising
 - Fastresume (no rehashing)
 - Download / upload rate limiting
 - Prometheus metrics at ```/metrics``` and ```/torrents/<id_or_infohash>/peer_stats/prometheus```

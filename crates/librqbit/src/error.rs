@@ -112,14 +112,14 @@ pub enum Error {
     #[error("bug: invalid peer state")]
     BugInvalidPeerState,
 
-    #[error("peer is in unexpected state: {state}. Expected dead")]
-    BugPeerExpectedDead { state: &'static str },
-
     #[error("file is None, torrent was probably paused")]
     FsFileIsNone,
 
     #[error("session is dead")]
     SessionDestroyed,
+
+    #[error(transparent)]
+    Core(#[from] librqbit_core::Error),
 }
 
 pub type Result<T> = core::result::Result<T, Error>;

@@ -5,7 +5,6 @@ use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
     sync::Arc,
-    thread,
     time::Duration,
 };
 
@@ -14,21 +13,20 @@ use clap::{CommandFactory, Parser, ValueEnum};
 use clap_complete::Shell;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ConnectionOptions,
-    CreateTorrentOptions, ListOnlyResponse, ListenerMode, ListenerOptions, PeerConnectionOptions,
-    Session, SessionOptions, SessionPersistenceConfig, TorrentStatsState,
+    CreateTorrentOptions, DhtSessionConfig, ListOnlyResponse, ListenerMode, ListenerOptions,
+    PeerConnectionOptions, Session, SessionOptions, SessionPersistenceConfig, TorrentStatsState,
+    dht::DhtPersistenceConfig,
     http_api::{HttpApi, HttpApiOptions},
     librqbit_spawn,
     limits::LimitsConfig,
-    storage::{
-        StorageFactory, StorageFactoryExt,
-        filesystem::{FilesystemStorageFactory, MmapFilesystemStorageFactory},
-    },
+    storage::{StorageFactory, StorageFactoryExt, filesystem::FilesystemStorageFactory},
     tracing_subscriber_config_utils::{InitLoggingOptions, InitLoggingResult, init_logging},
 };
 use librqbit_dualstack_sockets::TcpListener;
+use mdns_sd::{DaemonEvent, ServiceDaemon, ServiceInfo};
 use size_format::SizeFormatterBinary as SF;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug_span, error, info, trace_span, warn};
+use tracing::{debug, debug_span, error, info, trace_span, warn};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum LogLevel {
@@ -83,6 +81,8 @@ struct Opts {
         env = "RQBIT_LOG_FILE_RUST_LOG"
     )]
     log_file_rust_log: String,
+    #[arg(long = "log-file-json", env = "RQBIT_LOG_FILE_JSON")]
+    log_file_json: bool,
 
     /// The interval to poll trackers, e.g. 30s.
     /// Trackers send the refresh interval when we connect to them. Often this is
@@ -92,14 +92,31 @@ struct Opts {
 
     /// The listen address for HTTP API.
     ///
-    /// If not set, "rqbit server" will listen on 127.0.0.1:3030, and "rqbit download" will listen
-    /// on an ephemeral port that it will print.
+    /// This option will be ignored if rqbit is passed a socket by systemd via socket activation.
+    ///
+    /// Otherwise, if not set, "rqbit server" will listen on 127.0.0.1:3030, and "rqbit download"
+    /// will listen on an ephemeral port that it will print.
     #[arg(long = "http-api-listen-addr", env = "RQBIT_HTTP_API_LISTEN_ADDR")]
     http_api_listen_addr: Option<SocketAddr>,
 
     /// Allow creating torrents via HTTP API
     #[arg(long = "http-api-allow-create", env = "RQBIT_HTTP_API_ALLOW_CREATE")]
     http_api_allow_create: bool,
+
+    /// Upload body size limit in bytes.
+    #[arg(
+        long = "http-api-max-upload-size",
+        env = "RQBIT_HTTP_API_MAX_UPLOAD_SIZE"
+    )]
+    http_api_max_upload_size: Option<usize>,
+
+    /// Advertise the HTTP API on the local network via mDNS/DNS-SD, so it can
+    /// be reached at http://rqbit.local:PORT from other devices on your LAN.
+    ///
+    /// Requires the HTTP API to listen on a non-loopback address, e.g.
+    /// --http-api-listen-addr 0.0.0.0:3030.
+    #[arg(long = "enable-mdns", env = "RQBIT_MDNS_ENABLE")]
+    enable_mdns: bool,
 
     /// Set this flag if you want to use tokio's single threaded runtime.
     /// It MAY perform better, but the main purpose is easier debugging, as time
@@ -224,18 +241,6 @@ struct Opts {
         env = "RQBIT_RUNTIME_MAX_BLOCKING_THREADS"
     )]
     max_blocking_threads: u16,
-
-    /// If you set this to something, all writes to disk will happen in background and be
-    /// buffered in memory up to approximately the given number of megabytes.
-    ///
-    /// Might be useful for slow disks.
-    #[arg(long = "defer-writes-up-to", env = "RQBIT_DEFER_WRITES_UP_TO")]
-    defer_writes_up_to: Option<usize>,
-
-    /// Use mmap (file-backed) for storage. Any advantages are questionable and unproven.
-    /// If you use it, you know what you are doing.
-    #[arg(long)]
-    experimental_mmap_storage: bool,
 
     /// If set will use socks5 proxy for all outgoing connections.
     /// The format is socks5://[username:password]@host:port
@@ -382,6 +387,15 @@ struct DownloadOpts {
     /// Disable HTTP API entirely.
     #[arg(long = "disable-http-api")]
     disable_http_api: bool,
+
+    /// Forward the listen port through UPnP on your router.
+    ///
+    /// By default "rqbit download" does not port-forward, as it is an
+    /// ephemeral one-shot process. Set this to forward the port for the
+    /// duration of the download (e.g. to become connectable). Still respects
+    /// the global --disable-upnp-port-forward.
+    #[arg(long = "upnp-port-forward", env = "RQBIT_UPNP_PORT_FORWARD")]
+    upnp_port_forward: bool,
 }
 
 #[derive(Clone)]
@@ -431,6 +445,55 @@ enum SubCommand {
     Completions(CompletionsOpts),
 }
 
+/// Return the API listener socket passed to rqbit by systemd, if any.
+///
+/// An error indicates that the process was passed socket information by systemd, but we were unable
+/// to parse and/or use it.
+///
+/// Returns `None` if this function has already been called or if no socket was provided by systemd.
+#[cfg(target_os = "linux")]
+fn api_socket_from_systemd() -> anyhow::Result<Option<TcpListener>> {
+    use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+    use std::str::FromStr;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Make sure we can only use the socket passed by systemd once.
+    static ACTIVATED: AtomicBool = AtomicBool::new(false);
+    if ACTIVATED.swap(true, Ordering::AcqRel) {
+        return Ok(None);
+    }
+
+    /// Read and an environment variable as `T` using `FromStr`.
+    fn parse_env<T: FromStr>(name: &str) -> anyhow::Result<Option<T>> {
+        let Some(var) = std::env::var_os(name) else {
+            return Ok(None);
+        };
+        let Some(var) = var.to_str() else {
+            anyhow::bail!("environment variable {name} has an invalid utf8 value {var:?}")
+        };
+        let Ok(parsed) = var.parse() else {
+            anyhow::bail!("failed to parse {var} as {}", std::any::type_name::<T>())
+        };
+        Ok(Some(parsed))
+    }
+
+    /// The first file descriptor passed by systemd, defined in <systemd/sd-daemon>.
+    const SD_LISTEN_FDS_START: RawFd = 3;
+
+    match parse_env::<u32>("LISTEN_PID")? {
+        Some(pid) if pid == std::process::id() => {}
+        _ => return Ok(None),
+    };
+    match parse_env("LISTEN_FDS")? {
+        Some(1) => {}
+        Some(0) | None => return Ok(None),
+        Some(count) => anyhow::bail!("unexpected number of sockets {count} != 1"),
+    }
+
+    let listen_fd = unsafe { OwnedFd::from_raw_fd(SD_LISTEN_FDS_START) };
+    Ok(Some(TcpListener::try_from(listen_fd)?))
+}
+
 fn main() -> anyhow::Result<()> {
     let opts = Opts::parse();
 
@@ -477,7 +540,7 @@ fn main() -> anyhow::Result<()> {
         let token = token.clone();
         use signal_hook::{consts::SIGINT, consts::SIGTERM, iterator::Signals};
         let mut signals = Signals::new([SIGINT, SIGTERM])?;
-        thread::spawn(move || {
+        std::thread::spawn(move || {
             let mut cancel_triggered = false;
             while let Some(sig) = signals.forever().next() {
                 if cancel_triggered {
@@ -537,6 +600,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         }),
         log_file: opts.log_file.as_deref(),
         log_file_rust_log: Some(&opts.log_file_rust_log),
+        log_file_json: opts.log_file_json,
     })?;
 
     match librqbit::try_increase_nofile_limit() {
@@ -568,14 +632,26 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         ..Default::default()
     });
 
+    let dht = if opts.disable_dht {
+        None
+    } else {
+        let persistence = if opts.disable_dht_persistence {
+            None
+        } else {
+            Some(DhtPersistenceConfig::default())
+        };
+        Some(DhtSessionConfig {
+            bootstrap_addrs: opts
+                .dht_bootstrap_addrs
+                .as_ref()
+                .map(|s| s.split(",").map(|v| v.to_string()).collect()),
+            port: None,
+            persistence,
+        })
+    };
+
     let mut sopts = SessionOptions {
-        disable_dht: opts.disable_dht,
-        disable_dht_persistence: opts.disable_dht_persistence,
-        dht_bootstrap_addrs: opts
-            .dht_bootstrap_addrs
-            .as_ref()
-            .map(|s| s.split(",").map(|v| v.to_string()).collect()),
-        dht_config: None,
+        dht,
         // This will be overridden by "server start" below if needed.
         persistence: None,
         peer_id: None,
@@ -591,7 +667,6 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         }),
         bind_device_name: opts.bind_device_name.take(),
         dns_server: opts.dns_server,
-        defer_writes_up_to: opts.defer_writes_up_to,
         default_storage_factory: Some({
             fn wrap<S: StorageFactory + Clone>(s: S) -> impl StorageFactory {
                 #[cfg(feature = "debug_slow_disk")]
@@ -605,11 +680,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
                 s
             }
 
-            if opts.experimental_mmap_storage {
-                wrap(MmapFilesystemStorageFactory::default()).boxed()
-            } else {
-                wrap(FilesystemStorageFactory::default()).boxed()
-            }
+            wrap(FilesystemStorageFactory::default()).boxed()
         }),
         concurrent_init_limit: Some(opts.concurrent_init_limit),
         root_span: None,
@@ -629,6 +700,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         peer_limit: opts.peer_limit,
         runtime_worker_threads: Some(opts.max_blocking_threads as usize),
         ipv4_only: opts.ipv4_only,
+        client_name_and_version: None,
     };
 
     #[allow(clippy::needless_update)]
@@ -643,6 +715,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             None
         },
         allow_create: opts.http_api_allow_create,
+        max_upload_body_size: opts.http_api_max_upload_size,
 
         // We need to install prometheus recorder early before we registered any metrics.
         #[cfg(feature = "prometheus")]
@@ -725,7 +798,9 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             }
 
             // "rqbit download" is ephemeral, so disable all persistence.
-            sopts.disable_dht_persistence = true;
+            if let Some(ref mut dht) = sopts.dht {
+                dht.persistence = None;
+            }
             sopts.persistence = None;
 
             let mut disable_http_api = download_opts.disable_http_api;
@@ -736,8 +811,10 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             }
 
             if let Some(listen) = sopts.listen.as_mut() {
-                // We are creating an ephemeral download, no point in port forwarding.
-                listen.enable_upnp_port_forwarding = false;
+                // "rqbit download" is ephemeral, so by default don't port-forward.
+                // --upnp-port-forward opts in, but the global --disable-upnp-port-forward
+                // still acts as an off-switch.
+                listen.enable_upnp_port_forwarding &= download_opts.upnp_port_forward;
             }
 
             let torrent_opts = || AddTorrentOptions {
@@ -869,7 +946,9 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             }
 
             // "rqbit share" is ephemeral, so disable all persistence.
-            sopts.disable_dht_persistence = true;
+            if let Some(ref mut dht) = sopts.dht {
+                dht.persistence = None;
+            }
             sopts.persistence = None;
 
             if sopts.listen.is_none() {
@@ -936,11 +1015,29 @@ async fn start_http_api(
         Some(log_config.rust_log_reload_tx),
         Some(log_config.line_broadcast),
     );
+
+    #[cfg(target_os = "linux")]
+    let systemd_listener = api_socket_from_systemd().unwrap_or_else(|e| {
+        error!("systemd socket-activation failed: {e}");
+        None
+    });
+    #[cfg(not(target_os = "linux"))]
+    let systemd_listener = None;
     let http_api = HttpApi::new(api, Some(http_api_opts));
-    let listener = TcpListener::bind_tcp(listen_addr, Default::default())
-        .with_context(|| format!("error binding HTTP server to {listen_addr}"))?;
+    let listener = match systemd_listener {
+        Some(listener) => listener,
+        None => TcpListener::bind_tcp(listen_addr, Default::default())
+            .with_context(|| format!("error binding HTTP server to {listen_addr}"))?,
+    };
+
     let listen_addr = listener.bind_addr();
     info!("started HTTP API at http://{listen_addr}");
+
+    let mdns_advertisement = if opts.enable_mdns {
+        Some(advertise_http_api(listen_addr)?)
+    } else {
+        None
+    };
 
     let mut upnp_server = {
         match opts.enable_upnp_server {
@@ -969,6 +1066,9 @@ async fn start_http_api(
     let http_api_fut = http_api.make_http_api_and_run(listener, upnp_router);
 
     Ok(async move {
+        // Keep the mDNS advertisement (if any) alive for the server's lifetime.
+        let _mdns_advertisement = mdns_advertisement;
+
         let res = match upnp_server {
             Some(srv) => {
                 let upnp_fut = srv.run_ssdp_forever();
@@ -987,12 +1087,111 @@ async fn start_http_api(
     })
 }
 
+/// RAII guard: dropping it shuts down the daemon, sending mDNS "goodbye" packets.
+struct MdnsAdvertisement {
+    daemon: ServiceDaemon,
+}
+
+impl Drop for MdnsAdvertisement {
+    fn drop(&mut self) {
+        if let Err(e) = self.daemon.shutdown() {
+            warn!("error shutting down mDNS daemon: {e:#}");
+        }
+    }
+}
+
+/// Advertise the HTTP API over mDNS/DNS-SD as `rqbit.local`, so the Web UI is
+/// reachable at `http://rqbit.local:<port>` from other LAN devices.
+///
+/// Keep the returned guard alive for as long as the advertisement should be
+/// published.
+fn advertise_http_api(listen_addr: SocketAddr) -> anyhow::Result<MdnsAdvertisement> {
+    // mDNS names are fully-qualified and must end with a dot.
+    const SERVICE_TYPE: &str = "_http._tcp.local.";
+    const INSTANCE_NAME: &str = "rqbit";
+    const HOSTNAME: &str = "rqbit.local.";
+
+    let ip = listen_addr.ip();
+    if ip.is_loopback() {
+        bail!(
+            "cannot enable mDNS as the HTTP API listen addr is loopback. \
+             Change --http-api-listen-addr to bind to 0.0.0.0 or ::"
+        );
+    }
+
+    // Advertise the bound address. For a wildcard bind, addr_auto instead makes
+    // the daemon publish (and keep updated) every host address.
+    let addr_auto = ip.is_unspecified();
+    let addr = if addr_auto {
+        String::new()
+    } else {
+        ip.to_string()
+    };
+    let port = listen_addr.port();
+    let properties = [("path", "/")];
+
+    let mut service_info = ServiceInfo::new(
+        SERVICE_TYPE,
+        INSTANCE_NAME,
+        HOSTNAME,
+        addr.as_str(),
+        port,
+        &properties[..],
+    )
+    .context("error building mDNS service info")?;
+    if addr_auto {
+        service_info = service_info.enable_addr_auto();
+    }
+
+    let daemon = ServiceDaemon::new().context("error creating mDNS daemon")?;
+
+    // Probing/conflict resolution runs asynchronously after register(), so log
+    // the names the daemon actually settles on as it reports them.
+    let monitor = daemon.monitor().context("error monitoring mDNS daemon")?;
+    librqbit_spawn(
+        debug_span!("mdns_monitor"),
+        "mdns_monitor",
+        mdns_monitor(monitor),
+    );
+
+    daemon
+        .register(service_info)
+        .context("error registering mDNS service")?;
+
+    info!(
+        "advertising HTTP API over mDNS on port {port} (requested hostname {})",
+        HOSTNAME.trim_end_matches('.')
+    );
+
+    Ok(MdnsAdvertisement { daemon })
+}
+
+/// Logs the hostnames the mDNS daemon settles on (including conflict renames)
+/// and any daemon errors, until it shuts down and closes the channel.
+async fn mdns_monitor(monitor: mdns_sd::Receiver<DaemonEvent>) -> anyhow::Result<()> {
+    while let Ok(event) = monitor.recv_async().await {
+        match event {
+            DaemonEvent::NameChange(c) => warn!(
+                "mDNS name {:?} is already taken on the LAN; advertising as {:?} instead",
+                c.original.trim_end_matches('.'),
+                c.new_name.trim_end_matches('.'),
+            ),
+            DaemonEvent::Error(e) => warn!("mDNS daemon error: {e:#}"),
+            DaemonEvent::Announce(fullname, host_intf) => {
+                debug!("mDNS announced {fullname} on {host_intf}")
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 async fn stats_printer(session: Arc<Session>) -> Result<(), &'static str> {
     loop {
         session.with_torrents(|torrents| {
                 for (idx, torrent) in torrents {
                     let stats = torrent.stats();
-                    if let TorrentStatsState::Initializing = stats.state {
+                    if let TorrentStatsState::Initializing { .. } = stats.state {
                         let total = stats.total_bytes;
                         let progress = stats.progress_bytes;
                         let pct =  (progress as f64 / total as f64) * 100f64;

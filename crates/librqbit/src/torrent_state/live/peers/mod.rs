@@ -3,11 +3,9 @@ use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 use dashmap::DashMap;
 use librqbit_core::lengths::ValidPieceIndex;
 use parking_lot::RwLock;
-use peer_binary_protocol::{Message, Request};
 
 use crate::{
     Error,
-    peer_connection::WriterRequest,
     torrent_state::utils::{TimedExistence, atomic_inc},
     type_aliases::{BF, PeerHandle},
 };
@@ -158,21 +156,7 @@ impl PeerStates {
         self.session_stats.inc_steals();
 
         self.with_live_mut(from_peer, "send_cancellations", |live| {
-            let to_remove = live
-                .inflight_requests
-                .iter()
-                .filter(|r| r.piece_index == stolen_idx)
-                .copied()
-                .collect::<Vec<_>>();
-            for req in to_remove {
-                let _ = live
-                    .tx
-                    .send(WriterRequest::Message(Message::Cancel(Request {
-                        index: stolen_idx.get(),
-                        begin: req.offset,
-                        length: req.size,
-                    })));
-            }
+            live.cancel_inflight_requests_for_piece(stolen_idx);
         });
     }
 }
