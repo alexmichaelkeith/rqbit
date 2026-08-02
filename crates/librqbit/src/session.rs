@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    future::Future,
     io::Read,
     net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
@@ -581,6 +582,30 @@ pub(crate) struct CheckedIncomingConnection {
     pub handshake: Handshake,
 }
 
+enum ListenerEvent<Accepted, Checked> {
+    Accepted(Accepted),
+    HandshakeChecked(Checked),
+}
+
+async fn next_listener_event<AcceptFuture, CheckFuture>(
+    accept: AcceptFuture,
+    checks: &mut FuturesUnordered<CheckFuture>,
+    max_pending_checks: usize,
+) -> ListenerEvent<AcceptFuture::Output, CheckFuture::Output>
+where
+    AcceptFuture: Future,
+    CheckFuture: Future,
+{
+    tokio::select! {
+        accepted = accept, if checks.len() < max_pending_checks => {
+            ListenerEvent::Accepted(accepted)
+        }
+        Some(checked) = checks.next(), if !checks.is_empty() => {
+            ListenerEvent::HandshakeChecked(checked)
+        }
+    }
+}
+
 struct InternalAddResult {
     info_hash: Id20,
     metadata: Option<TorrentMetadata>,
@@ -1060,20 +1085,28 @@ impl Session {
         drop(self);
 
         loop {
-            tokio::select! {
-                r = l.accept(), if futs.len() < max_pending_incoming_handshake_checks => {
-                    match r {
+            match next_listener_event(l.accept(), &mut futs, max_pending_incoming_handshake_checks)
+                .await
+            {
+                ListenerEvent::Accepted(result) => {
+                    match result {
                         Ok((addr, (read, write))) => {
                             trace!("accepted connection from {addr}");
                             let session = session.upgrade().context("session is dead")?;
                             let span = debug_span!(parent: session.rs(), "incoming", addr=%addr);
                             futs.push(
-                                session.check_incoming_connection(addr, A::KIND, Box::new(read), Box::new(write))
+                                session
+                                    .check_incoming_connection(
+                                        addr,
+                                        A::KIND,
+                                        Box::new(read),
+                                        Box::new(write),
+                                    )
                                     .map_err(|e| {
                                         debug!("error checking incoming connection: {e:#}");
                                         e
                                     })
-                                    .instrument(span)
+                                    .instrument(span),
                             );
                         }
                         Err(e) => {
@@ -1081,16 +1114,22 @@ impl Session {
                             // Whatever is the reason, ensure we are not stuck trying to
                             // accept indefinitely.
                             tokio::time::sleep(Duration::from_secs(10)).await;
-                            continue
+                            continue;
                         }
                     }
-                },
-                Some(Ok((live, checked))) = futs.next(), if !futs.is_empty() => {
-                    let (addr, kind) = (checked.addr, checked.kind);
-                    if let Err(e) = live.add_incoming_peer(checked) {
-                        warn!(?addr, ?kind, "error handing over incoming connection: {e:#}");
+                }
+                ListenerEvent::HandshakeChecked(result) => {
+                    if let Ok((live, checked)) = result {
+                        let (addr, kind) = (checked.addr, checked.kind);
+                        if let Err(e) = live.add_incoming_peer(checked) {
+                            warn!(
+                                ?addr,
+                                ?kind,
+                                "error handing over incoming connection: {e:#}"
+                            );
+                        }
                     }
-                },
+                }
             }
         }
     }
@@ -1908,10 +1947,30 @@ mod tests {
     use std::path::PathBuf;
 
     use buffers::ByteBuf;
+    use futures::{future, stream::FuturesUnordered};
     use itertools::Itertools;
     use librqbit_core::torrent_metainfo::{TorrentMetaV1, torrent_from_bytes};
 
-    use super::{Session, SessionOptions, torrent_file_from_info_bytes};
+    use super::{
+        ListenerEvent, Session, SessionOptions, next_listener_event, torrent_file_from_info_bytes,
+    };
+
+    #[tokio::test]
+    async fn failed_handshake_check_at_backlog_cap_is_drained() {
+        const MAX_PENDING: usize = 4;
+        let mut checks = FuturesUnordered::new();
+        for _ in 0..MAX_PENDING {
+            checks.push(future::ready(Err::<(), _>("invalid handshake")));
+        }
+
+        let event = next_listener_event(future::pending::<()>(), &mut checks, MAX_PENDING).await;
+
+        assert!(matches!(
+            event,
+            ListenerEvent::HandshakeChecked(Err("invalid handshake"))
+        ));
+        assert_eq!(checks.len(), MAX_PENDING - 1);
+    }
 
     #[tokio::test]
     async fn bound_session_requires_dns_server() {
