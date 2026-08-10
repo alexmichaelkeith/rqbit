@@ -16,7 +16,7 @@ sha1-ring = ["sha1w/sha1-ring"]
 
 [dependencies]
 tracing = "0.1.40"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 hex = "0.4"
 anyhow = "1"
 url = { version = "2", default-features = false }
@@ -37,6 +37,7 @@ memchr = "2.7.5"
 thiserror = "2.0.12"
 chardetng = "0.1.17"
 encoding_rs = "0.8.35"
+librqbit-dualstack-sockets = "0.6.11"
 
 [dev-dependencies]
 serde_json = "1"

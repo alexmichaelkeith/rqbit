@@ -1,6 +1,7 @@
 pub mod compact_ip;
 pub mod constants;
 pub mod directories;
+pub mod dns;
 mod error;
 pub mod hash_id;
 pub mod lengths;

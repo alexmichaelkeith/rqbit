@@ -2917,6 +2917,7 @@ dependencies = [
  "librqbit-bencode",
  "librqbit-buffers",
  "librqbit-clone-to-owned",
+ "librqbit-dualstack-sockets",
  "librqbit-sha1-wrapper",
  "memchr",
  "parking_lot",

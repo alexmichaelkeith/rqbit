@@ -121,6 +121,12 @@ use super::{
 struct InflightPiece {
     peer: PeerHandle,
     started: Instant,
+    /// Last time a chunk was received for this piece (for stall detection)
+    last_chunk_received: Instant,
+    /// Number of chunks received so far (to detect progress)
+    chunks_received: u32,
+    /// Number of times this piece has been stolen (for adaptive timeout)
+    steal_count: u32,
 }
 
 fn make_piece_bitfield(lengths: &Lengths) -> BF {
@@ -194,7 +200,6 @@ pub struct TorrentStateLive {
     peer_queue_tx: UnboundedSender<SocketAddr>,
 
     finished_notify: Notify,
-    new_pieces_notify: Notify,
 
     down_speed_estimator: SpeedEstimator,
     up_speed_estimator: SpeedEstimator,
@@ -279,7 +284,6 @@ impl TorrentStateLive {
             peer_semaphore: Arc::new(Semaphore::new(
                 paused.shared.options.peer_limit.unwrap_or(128),
             )),
-            new_pieces_notify: Notify::new(),
             peer_queue_tx,
             finished_notify: Notify::new(),
             down_speed_estimator,
@@ -696,6 +700,55 @@ impl TorrentStateLive {
             .get_chunks()
             .ok()
             .map(|c| *c.get_hns())
+    }
+
+    /// Returns per-piece state array:
+    ///   0 = empty (needed but not queued or in-flight)
+    ///   1 = have (downloaded + verified)
+    ///   2 = queued (in queue_pieces, waiting for a peer slot)
+    ///   3 = in-flight (currently being downloaded from a peer)
+    ///
+    /// Also returns the list of priority piece indices from active streams.
+    pub fn get_piece_states(&self) -> Option<(Vec<u8>, Vec<u32>)> {
+        let g = self.lock_read("get_piece_states");
+        let chunks = g.get_chunks().ok()?;
+
+        let total = self.lengths.total_pieces() as usize;
+        let mut states = vec![0u8; total];
+
+        // Mark have pieces
+        let have = chunks.get_have_pieces().as_slice();
+        for i in 0..total {
+            if have[i] {
+                states[i] = 1;
+            }
+        }
+
+        // Mark in-flight pieces
+        for piece_id in g.inflight_pieces.keys() {
+            let idx = piece_id.get() as usize;
+            if idx < total && states[idx] != 1 {
+                states[idx] = 3; // in-flight
+            }
+        }
+
+        // Mark queued pieces (needed but not in-flight and not have)
+        // queue_pieces = selected & !have, and reserve_needed_piece removes from it
+        // So queue_pieces minus inflight gives us "queued but not yet in-flight"
+        for piece in chunks.iter_queued_pieces(&g.file_priorities, &self.metadata.file_infos) {
+            let idx = piece.get() as usize;
+            if idx < total && states[idx] == 0 {
+                states[idx] = 2; // queued
+            }
+        }
+
+        // Collect priority pieces from active streams
+        let priority: Vec<u32> = self.streams.get_all_priority_pieces()
+            .iter()
+            .map(|p| p.get())
+            .collect();
+
+        Some((states, priority))
     }
 
     fn transmit_haves(&self, index: ValidPieceIndex) {
@@ -1217,6 +1270,9 @@ impl PeerHandler {
             PeerState::Connecting(_) => {}
             PeerState::Live(live) => {
                 let mut g = self.state.lock_write("mark_chunk_requests_canceled");
+                // Collect unique piece indices that this dead peer had in flight.
+                let mut dead_peer_pieces: std::collections::HashSet<ValidPieceIndex> =
+                    std::collections::HashSet::new();
                 for req in live.inflight_requests {
                     trace!(
                         "peer dead, marking chunk request cancelled, index={}, chunk={}",
@@ -1225,8 +1281,36 @@ impl PeerHandler {
                     );
                     g.get_chunks_mut()?
                         .mark_piece_broken_if_not_have(req.piece_index);
-                    self.state.new_pieces_notify.notify_waiters();
+                    dead_peer_pieces.insert(req.piece_index);
                 }
+                // Remove inflight_pieces entries owned by this dead peer so that
+                // other peers can re-reserve them through normal reservation
+                // instead of relying solely on steal detection. Without this,
+                // pieces assigned to a dead peer stay "inflight" indefinitely and
+                // can only be reclaimed via try_steal_priority_piece (2s stall) or
+                // try_steal_old_slow_piece (requires the stealer to have completed
+                // at least one piece). On low-seeder torrents during cold start
+                // this causes pieces to get stuck forever.
+                let mut freed_count = 0u32;
+                for piece_idx in &dead_peer_pieces {
+                    if g.inflight_pieces
+                        .get(piece_idx)
+                        .map(|p| p.peer == handle)
+                        .unwrap_or(false)
+                    {
+                        g.inflight_pieces.remove(piece_idx);
+                        freed_count += 1;
+                    }
+                }
+                if freed_count > 0 {
+                    info!(
+                        peer = %handle,
+                        freed_pieces = freed_count,
+                        "peer died: freed {} inflight pieces for re-reservation",
+                        freed_count
+                    );
+                }
+                self.state.streams.new_pieces_notify.notify_waiters();
             }
             PeerState::NotNeeded => {
                 // Restore it as std::mem::take() replaced it above.
@@ -1342,25 +1426,104 @@ impl PeerHandler {
                     let mut n_opt = None;
                     let bf = &live.bitfield;
                     let chunk_tracker = g.get_chunks()?;
+                    
+                    // Collect ALL priority pieces for diagnostic logging
+                    let all_priority = self.state.streams.get_all_priority_pieces();
+                    
+                    // Debug: log inflight pieces early on
+                    let inflight_count = g.inflight_pieces.len();
+                    if inflight_count < 20 {
+                        let inflight_ids: Vec<_> = g.inflight_pieces.keys().map(|p| p.get()).collect();
+                        debug!(
+                            ?inflight_ids,
+                            inflight_count,
+                            "reserve_next_needed_piece: current inflight pieces"
+                        );
+                    }
+                    
+                    // Diagnostic: for each priority piece, log its exact status from
+                    // this peer's perspective. This tells us WHY piece 8 is stuck.
+                    if !all_priority.is_empty() {
+                        let mut status_lines: Vec<String> = Vec::new();
+                        for pid in all_priority.iter().take(20) {
+                            let have = chunk_tracker.is_piece_have(*pid);
+                            let inflight = g.inflight_pieces.contains_key(pid);
+                            let peer_has = bf.get(pid.get() as usize).as_deref() == Some(&true);
+                            let holder = if inflight {
+                                g.inflight_pieces.get(pid).map(|ip| format!("{} ({}ms stall, {} chunks, {} steals)", 
+                                    ip.peer, ip.last_chunk_received.elapsed().as_millis(), ip.chunks_received, ip.steal_count))
+                            } else {
+                                None
+                            };
+                            if !have {
+                                status_lines.push(format!(
+                                    "p{}:peer_has={},inflight={}{}", 
+                                    pid.get(), peer_has, inflight,
+                                    holder.map(|h| format!(",holder={}", h)).unwrap_or_default()
+                                ));
+                            }
+                        }
+                        if !status_lines.is_empty() {
+                            info!(
+                                peer = %self.addr,
+                                choked = false,
+                                "📊 PRIORITY PIECE STATUS: [{}]",
+                                status_lines.join(" | ")
+                            );
+                        }
+                    }
+                    
                     let priority_streamed_pieces = self
                         .state
                         .streams
                         .iter_next_pieces(&self.state.lengths)
                         .filter(|pid| {
-                            !chunk_tracker.is_piece_have(*pid)
-                                && !g.inflight_pieces.contains_key(pid)
+                            let have = chunk_tracker.is_piece_have(*pid);
+                            let inflight = g.inflight_pieces.contains_key(pid);
+                            !have && !inflight
                         });
-                    let natural_order_pieces = chunk_tracker
-                        .iter_queued_pieces(&g.file_priorities, &self.state.metadata.file_infos);
+                    // When streaming, the priority + lookahead pieces from
+                    // iter_next_pieces already cover everything the user needs.
+                    // Falling through to natural_order_pieces would download
+                    // sequential pieces from piece 0 which is never useful
+                    // while the user is watching at a completely different
+                    // position. Only chain natural_order when NOT streaming,
+                    // OR when background_download is explicitly enabled
+                    // (the application wants to fill all remaining pieces).
+                    // Use has_streaming_context() instead of stream_count() > 0
+                    // so that even when all browser connections are briefly closed,
+                    // we continue using the ghost position from iter_next_pieces
+                    // rather than reverting to piece 0.
+                    let is_streaming = self.state.streams.has_streaming_context();
+                    let bg_download = self.state.streams.background_download_enabled();
+
+                    let natural_order_pieces: Box<dyn Iterator<Item = ValidPieceIndex>> = if is_streaming && !bg_download {
+                        Box::new(std::iter::empty())
+                    } else {
+                        Box::new(
+                            chunk_tracker
+                                .iter_queued_pieces(&g.file_priorities, &self.state.metadata.file_infos)
+                        )
+                    };
+
                     for n in priority_streamed_pieces.chain(natural_order_pieces) {
-                        if bf.get(n.get() as usize).map(|v| *v) == Some(true) {
+                        if bf.get(n.get() as usize).as_deref() == Some(&true) {
                             n_opt = Some(n);
                             break;
                         }
                     }
 
                     match n_opt {
-                        Some(n_opt) => n_opt,
+                        Some(n_opt) => {
+                            // Log which piece was selected
+                            if n_opt.get() < 20 {
+                                debug!(
+                                    piece_id = n_opt.get(),
+                                    "reserve_next_needed_piece: selected piece"
+                                );
+                            }
+                            n_opt
+                        }
                         None => return Ok(None),
                     }
                 };
@@ -1369,6 +1532,9 @@ impl PeerHandler {
                     InflightPiece {
                         peer: self.addr,
                         started: Instant::now(),
+                        last_chunk_received: Instant::now(),
+                        chunks_received: 0,
+                        steal_count: 0,
                     },
                 );
                 g.get_chunks_mut()?.reserve_needed_piece(n);
@@ -1376,6 +1542,208 @@ impl PeerHandler {
             })
             .transpose()
             .map(|r| r.flatten())
+    }
+
+    /// Try to steal a priority/streaming piece that has been in-flight too long.
+    /// Uses an absolute timeout rather than relative speed, so it works even
+    /// when this peer hasn't downloaded any pieces yet.
+    /// 
+    /// This is critical for cold start streaming: the first peer to grab piece 0
+    /// might be slow, and we need faster peers to steal it quickly.
+    /// 
+    /// Hybrid steal detection:
+    /// 1. STALL: No chunks received for stall_timeout → peer is dead
+    /// 2. SLOW: Piece started > 2s ago with < 50% progress → peer is too slow
+    fn try_steal_priority_piece(&self, stall_timeout: Duration) -> Option<ValidPieceIndex> {
+        // Get ACTUAL priority pieces set by streams (not just what iter_next_pieces returns)
+        let all_priority = self.state.streams.get_all_priority_pieces();
+        let stream_count = self.state.streams.stream_count();
+        
+        // ALWAYS log at INFO level for first peer call to diagnose cold start issues
+        // Only log once per peer (when they have 0 completed pieces)
+        let my_completed = self.counters.downloaded_and_checked_pieces.load(std::sync::atomic::Ordering::Relaxed);
+        if my_completed == 0 {
+            info!(
+                stream_count,
+                priority_count = all_priority.len(),
+                priority_pieces = ?all_priority.iter().take(5).map(|p| p.get()).collect::<Vec<_>>(),
+                "🔍 try_steal_priority_piece: first check for this peer"
+            );
+        }
+        
+        let priority_pieces: std::collections::HashSet<u32> = all_priority
+            .into_iter()
+            .map(|p| p.get())
+            .collect();
+        
+        if priority_pieces.is_empty() {
+            return None;
+        }
+
+        // A 4MB piece has ~256 chunks (16KB each). 
+        // At 4MB/s, should complete in 1s. After 3s with < 64 chunks (~25%) = too slow.
+        // More conservative thresholds to avoid "piece ping-pong" where pieces are
+        // constantly stolen before any peer has time to actually download them.
+        // The "slow" check only applies if the peer has received at least 1 chunk
+        // (proving they're actually trying), otherwise we use the stall check.
+        const SLOW_THRESHOLD_SECS: f64 = 3.0;
+        const MIN_CHUNKS_FOR_SLOW_THRESHOLD: u32 = 64; // ~25% of a 4MB piece
+
+        let (stolen_idx, from_peer, _steal_reason) = {
+            let mut g = self.state.lock_write("try_steal_priority_piece");
+            
+            // Find in-flight priority pieces that are STALLED or SLOW
+            let mut best_candidate: Option<(ValidPieceIndex, &'static str, Duration, SocketAddr, u32, u32)> = None;
+            
+            for (idx, req) in g.inflight_pieces.iter() {
+                if req.peer == self.addr {
+                    continue; // Don't steal from myself
+                }
+                if !priority_pieces.contains(&idx.get()) {
+                    continue; // Not a priority piece
+                }
+                
+                let stall_time = req.last_chunk_received.elapsed();
+                let total_time = req.started.elapsed();
+                
+                // Adaptive timeout: after 2+ steals, reduce timeout to find a working peer faster
+                // Base: 2000ms, after 2 steals: 1000ms, after 4 steals: 500ms (minimum)
+                let adaptive_stall_timeout = if req.steal_count >= 4 {
+                    Duration::from_millis(500)
+                } else if req.steal_count >= 2 {
+                    Duration::from_millis(1000)
+                } else {
+                    stall_timeout
+                };
+                
+                // Determine steal reason
+                let steal_reason: Option<&'static str> = if stall_time > adaptive_stall_timeout {
+                    // STALL: No chunks received recently → peer is dead
+                    Some("stalled")
+                } else if total_time > Duration::from_secs_f64(SLOW_THRESHOLD_SECS) 
+                       && req.chunks_received > 0  // Must have received at least 1 chunk
+                       && req.chunks_received < MIN_CHUNKS_FOR_SLOW_THRESHOLD {
+                    // SLOW: Been working > 3s, has started downloading but < 25% progress → peer is too slow
+                    Some("slow")
+                } else {
+                    None
+                };
+                
+                // Log priority piece checks — log ALL priority pieces, not just hardcoded IDs
+                debug!(
+                    piece = idx.get(),
+                    stall_ms = stall_time.as_millis(),
+                    total_ms = total_time.as_millis(),
+                    chunks_received = req.chunks_received,
+                    steal_count = req.steal_count,
+                    stall_timeout_ms = adaptive_stall_timeout.as_millis(),
+                    steal_reason = ?steal_reason,
+                    holder = %req.peer,
+                    "checking priority piece for steal"
+                );
+                
+                let reason = match steal_reason {
+                    Some(r) => r,
+                    None => {
+                        // Log WHY this priority piece is NOT stealable yet
+                        info!(
+                            piece = idx.get(),
+                            stall_ms = stall_time.as_millis(),
+                            total_ms = total_time.as_millis(),
+                            chunks = req.chunks_received,
+                            steals = req.steal_count,
+                            timeout_ms = adaptive_stall_timeout.as_millis(),
+                            holder = %req.peer,
+                            "🕐 priority piece NOT stealable: stall {}ms < timeout {}ms, chunks {} (need >{} after {}s for slow)",
+                            stall_time.as_millis(),
+                            adaptive_stall_timeout.as_millis(),
+                            req.chunks_received,
+                            MIN_CHUNKS_FOR_SLOW_THRESHOLD,
+                            SLOW_THRESHOLD_SECS,
+                        );
+                        continue;
+                    }
+                };
+                
+                // Prefer stealing pieces with the worst situation
+                // Priority: stalled > slow, then by longest stall/total time
+                let priority_score = match reason {
+                    "stalled" => (1, stall_time),
+                    "slow" => (0, total_time),
+                    _ => continue,
+                };
+                
+                if let Some((_, best_reason, best_time, _, _, _)) = best_candidate {
+                    let best_score = match best_reason {
+                        "stalled" => (1, best_time),
+                        _ => (0, best_time),
+                    };
+                    if priority_score > best_score {
+                        best_candidate = Some((*idx, reason, stall_time.max(total_time), req.peer, req.chunks_received, req.steal_count));
+                    }
+                } else {
+                    best_candidate = Some((*idx, reason, stall_time.max(total_time), req.peer, req.chunks_received, req.steal_count));
+                }
+            }
+            
+            // Diagnostic: check for priority pieces that are NOT inflight at all.
+            // These are "orphaned" — no peer has reserved them, meaning every peer
+            // that tried skipped them (no bitfield match, choked, or already had them).
+            let chunk_tracker_result = g.get_chunks();
+            if let Ok(chunk_tracker) = chunk_tracker_result {
+                let mut not_inflight_not_have: Vec<u32> = Vec::new();
+                for p_id in priority_pieces.iter() {
+                    let vpi_opt = self.state.lengths.validate_piece_index(*p_id);
+                    if let Some(vpi) = vpi_opt {
+                        let have = chunk_tracker.is_piece_have(vpi);
+                        let inflight = g.inflight_pieces.contains_key(&vpi);
+                        if !have && !inflight {
+                            not_inflight_not_have.push(*p_id);
+                        }
+                    }
+                }
+                if !not_inflight_not_have.is_empty() {
+                    warn!(
+                        peer = %self.addr,
+                        ?not_inflight_not_have,
+                        "⚠️ ORPHANED PRIORITY PIECES: {} pieces are priority, NOT downloaded, NOT inflight — no peer has reserved them!",
+                        not_inflight_not_have.len()
+                    );
+                }
+            }
+            
+            let (idx, reason, time, _holder, chunks, _steals) = best_candidate?;
+            
+            // We found a stealable piece - steal it!
+            if let Some(_g) = self.state.per_piece_locks[idx.get_usize()].try_write() {
+                if let Some(piece_req) = g.inflight_pieces.get_mut(&idx) {
+                    if piece_req.peer != self.addr {
+                        let new_steal_count = piece_req.steal_count + 1;
+                        info!(
+                            "🎯 STEALING {} priority piece {} from {}: {:?} elapsed, {} chunks received, steal #{} (timeout: {}ms)",
+                            reason, idx, piece_req.peer, time, chunks, new_steal_count,
+                            if new_steal_count >= 4 { 500 } else if new_steal_count >= 2 { 1000 } else { stall_timeout.as_millis() as u64 }
+                        );
+                        let old = piece_req.peer;
+                        piece_req.peer = self.addr;
+                        piece_req.started = Instant::now();
+                        piece_req.last_chunk_received = Instant::now();
+                        piece_req.chunks_received = 0; // Reset for new peer
+                        piece_req.steal_count = new_steal_count; // Increment steal count
+                        (idx, old, reason)
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        };
+
+        self.state.peers.on_steal(from_peer, self.addr, stolen_idx);
+        Some(stolen_idx)
     }
 
     /// Try to steal a piece from a slower peer. Threshold is
@@ -1406,6 +1774,8 @@ impl PeerHandler {
                     let old = piece_req.peer;
                     piece_req.peer = self.addr;
                     piece_req.started = Instant::now();
+                    piece_req.last_chunk_received = Instant::now();
+                    // Keep chunks_received - new peer continues from where old peer left off
                     (*idx, old)
                 } else {
                     debug!(?idx, ?piece_req, "attempted to steal but peer was writing");
@@ -1501,6 +1871,22 @@ impl PeerHandler {
                 }
             });
         self.on_bitfield_notify.notify_waiters();
+
+        // If the peer now has a piece that is in our priority set, wake all
+        // chunk requesters immediately.  Without this, the download loop only
+        // re-evaluates priority pieces on a 5-second timer — too slow for
+        // streaming when no connected peer previously had the piece.
+        if let Some(vpi) = self.state.lengths.validate_piece_index(have) {
+            let priority = self.state.streams.get_all_priority_pieces();
+            if priority.contains(&vpi) {
+                debug!(
+                    peer = %self.addr,
+                    piece = have,
+                    "🔔 Peer sent Have for priority piece — waking download loops",
+                );
+                self.state.streams.new_pieces_notify.notify_waiters();
+            }
+        }
     }
 
     fn on_bitfield(&self, bitfield: ByteBufOwned) -> anyhow::Result<()> {
@@ -1605,21 +1991,45 @@ impl PeerHandler {
             update_interest(self, true)?;
             aframe!(self.wait_for_unchoke()).await;
 
-            // Try steal a piece from a very slow peer first. Otherwise we might wait too long
-            // to download early pieces.
+            // Try steal priority pieces first with a reasonable stall timeout.
+            // This is critical for cold start streaming: don't wait forever for
+            // a dead peer to download piece 0.
+            // 
+            // 2000ms stall timeout = allows for realistic internet RTT (100-500ms)
+            // plus time for the peer to start sending chunks. Too aggressive (500ms)
+            // causes "piece ping-pong" where pieces are constantly stolen before
+            // any peer has time to actually download them.
+            // 
+            // Then try steal from very slow peers (10x threshold).
             // Then try get the next one in queue.
             // Afterwards means we are close to completion, try stealing more aggressively.
-            let new_piece_notify = self.state.new_pieces_notify.notified();
+            let new_piece_notify = self.state.streams.new_pieces_notify.notified();
             let next = match self
-                .try_steal_old_slow_piece(10.)
+                .try_steal_priority_piece(Duration::from_millis(2000))
+                .or_else(|| self.try_steal_old_slow_piece(10.))
                 .map_or_else(|| self.reserve_next_needed_piece(), |v| Ok(Some(v)))?
                 .or_else(|| self.try_steal_old_slow_piece(3.))
             {
                 Some(next) => next,
                 None => {
-                    debug!("no pieces to request");
+                    // Diagnostic: if we have priority pieces but couldn't act on
+                    // any of them, this is the "priority limbo" scenario.
+                    let priority = self.state.streams.get_all_priority_pieces();
+                    if !priority.is_empty() {
+                        let choked = self.lock_read("limbo_check").i_am_choked;
+                        let priority_ids: Vec<u32> = priority.iter().take(10).map(|p| p.get()).collect();
+                        warn!(
+                            peer = %self.addr,
+                            choked,
+                            ?priority_ids,
+                            total_priority = priority.len(),
+                            "⚠️ PRIORITY LIMBO: {} priority pieces exist but peer has nothing to do — sleeping 5s",
+                            priority.len()
+                        );
+                    } else {
+                        debug!("no pieces to request");
+                    }
                     match aframe!(tokio::time::timeout(
-                        // Half of default rw timeout not to race with it.
                         Duration::from_secs(5),
                         new_piece_notify
                     ))
@@ -1785,15 +2195,19 @@ impl PeerHandler {
             // we can actually checksum etc.
             // Otherwise it might get into some weird state.
             let ppl_guard = {
-                let g = state.lock_read("check_steal");
+                let mut g = state.lock_write("check_steal_and_update_chunk_progress");
 
                 let ppl = state
                     .per_piece_locks
                     .get(piece.index as usize)
                     .map(|l| l.read());
 
-                match g.inflight_pieces.get(&chunk_info.piece_index) {
-                    Some(InflightPiece { peer, .. }) if *peer == addr => {}
+                match g.inflight_pieces.get_mut(&chunk_info.piece_index) {
+                    Some(inflight) if inflight.peer == addr => {
+                        // Update chunk progress for stall detection
+                        inflight.last_chunk_received = Instant::now();
+                        inflight.chunks_received += 1;
+                    }
                     Some(InflightPiece { peer, .. }) => {
                         debug!(
                             "in-flight piece {} was stolen by {}, ignoring",
@@ -1928,7 +2342,7 @@ impl PeerHandler {
                         .lock_write("mark_piece_broken")
                         .get_chunks_mut()?
                         .mark_piece_broken_if_not_have(chunk_info.piece_index);
-                    state.new_pieces_notify.notify_waiters();
+                    state.streams.new_pieces_notify.notify_waiters();
                     anyhow::bail!("i am probably a bogus peer. dying.")
                 }
             };

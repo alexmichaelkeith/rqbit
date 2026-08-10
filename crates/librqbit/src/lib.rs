@@ -96,13 +96,14 @@ pub use session::{
 };
 pub use stream_connect::ConnectionOptions;
 pub use torrent_state::{
-    ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
-    TorrentStatsState,
+    FileStream, ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata,
+    TorrentStats, TorrentStatsState,
 };
 pub use type_aliases::FileInfos;
 
 pub use buffers::*;
 pub use clone_to_owned::CloneToOwned;
+pub use librqbit_core::lengths::{Lengths, ValidPieceIndex};
 pub use librqbit_core::magnet::*;
 pub use librqbit_core::peer_id::*;
 pub use librqbit_core::torrent_metainfo::*;

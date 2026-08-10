@@ -4,6 +4,7 @@ use anyhow::Context;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use librqbit_core::directories::get_configuration_directory;
+use librqbit_core::dns::HostResolver;
 use librqbit_core::spawn_utils::spawn_with_cancel;
 use librqbit_dualstack_sockets::BindDevice;
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,7 @@ use std::fs::OpenOptions;
 use std::io::{BufReader, BufWriter};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -88,6 +90,7 @@ impl PersistentDht {
         config: Option<PersistentDhtConfig>,
         cancellation_token: Option<CancellationToken>,
         bind_device: Option<&'a BindDevice>,
+        resolver: Option<Arc<dyn HostResolver>>,
     ) -> BoxFuture<'a, anyhow::Result<Dht>> {
         async move {
             let mut config = config.unwrap_or_default();
@@ -166,6 +169,7 @@ impl PersistentDht {
                 peer_store,
                 cancellation_token,
                 bind_device,
+                resolver,
                 ..Default::default()
             };
             let dht = DhtState::with_config(dht_config).await?;

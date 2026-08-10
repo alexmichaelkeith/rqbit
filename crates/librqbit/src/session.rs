@@ -2,11 +2,11 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     io::Read,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU16, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -58,6 +58,7 @@ use librqbit_core::{
     constants::CHUNK_SIZE,
     crate_version,
     directories::get_configuration_directory,
+    dns::{BoundDnsResolver, HostResolver},
     magnet::Magnet,
     peer_id::generate_azereus_style,
     spawn_utils::spawn_with_cancel,
@@ -68,7 +69,7 @@ use librqbit_utp::BindDevice;
 use parking_lot::RwLock;
 use peer_binary_protocol::Handshake;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
 use tracker_comms::{TrackerComms, UdpTrackerClient};
@@ -76,6 +77,12 @@ use tracker_comms::{TrackerComms, UdpTrackerClient};
 pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 
 pub type TorrentId = usize;
+
+const MAX_PENDING_INCOMING_HANDSHAKES: usize = 64;
+
+fn should_accept_more_incoming_handshake_checks(pending_handshakes: usize) -> bool {
+    pending_handshakes < MAX_PENDING_INCOMING_HANDSHAKES
+}
 
 struct ParsedTorrentFile {
     meta: TorrentMetaV1Owned,
@@ -114,11 +121,13 @@ pub struct Session {
 
     // Network
     peer_id: Id20,
-    announce_port: Option<u16>,
+    announce_port: AtomicU16,
+    announce_port_tx: watch::Sender<Option<u16>>,
     listen_addr: Option<SocketAddr>,
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
     reqwest_client: reqwest::Client,
+    resolver: Option<Arc<dyn HostResolver>>,
     udp_tracker_client: UdpTrackerClient,
     disable_trackers: bool,
 
@@ -152,6 +161,25 @@ pub struct Session {
     _disable_upload: bool,
     pub ipv4_only: bool,
     pub peer_limit: Option<usize>,
+}
+
+#[derive(Clone)]
+struct ReqwestDnsResolver {
+    inner: Arc<dyn HostResolver>,
+}
+
+impl reqwest::dns::Resolve for ReqwestDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let inner = self.inner.clone();
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addrs = inner
+                .resolve(&host, 0)
+                .await
+                .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { err.into() })?;
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 async fn torrent_from_url(
@@ -412,6 +440,10 @@ pub struct SessionOptions {
     /// On OSX will use IP(V6)_BOUND_IF, on Linux will use SO_BINDTODEVICE.
     pub bind_device_name: Option<String>,
 
+    /// DNS server used when a network device is selected. DNS requests are
+    /// bound to that device, and session creation fails if this is omitted.
+    pub dns_server: Option<IpAddr>,
+
     /// Disable tracker communication
     pub disable_trackers: bool,
 
@@ -534,6 +566,10 @@ impl Session {
                 warn!("uploading disabled");
             }
 
+            if opts.bind_device_name.is_some() && opts.dns_server.is_none() {
+                bail!("dns_server is required when bind_device_name is set");
+            }
+
             let bind_device = match opts.bind_device_name.as_ref() {
                 Some(name) => Some(
                     BindDevice::new_from_name(name)
@@ -541,6 +577,16 @@ impl Session {
                 ),
                 None => None,
             };
+            let resolver: Option<Arc<dyn HostResolver>> =
+                match (bind_device.as_ref(), opts.dns_server) {
+                    (Some(bind_device), Some(server)) => Some(Arc::new(BoundDnsResolver::new(
+                        server,
+                        bind_device.clone(),
+                        opts.ipv4_only,
+                    ))),
+                    (Some(_), None) => unreachable!("validated above"),
+                    (None, _) => None,
+                };
 
             let listen_result = if let Some(listen_opts) = opts.listen.take() {
                 Some(
@@ -565,6 +611,7 @@ impl Session {
                         bootstrap_addrs: opts.dht_bootstrap_addrs.clone(),
                         cancellation_token: Some(token.child_token()),
                         bind_device: bind_device.as_ref(),
+                        resolver: resolver.clone(),
                         ..Default::default()
                     })
                     .await
@@ -575,6 +622,7 @@ impl Session {
                         Some(pdht_config),
                         Some(token.clone()),
                         bind_device.as_ref(),
+                        resolver.clone(),
                     )
                     .await
                     .context("error initializing persistent DHT")?
@@ -651,6 +699,9 @@ impl Session {
                 .unwrap_or_default();
 
             let proxy_url = opts.connect.as_ref().and_then(|s| s.proxy_url.as_ref());
+            if bind_device.is_some() && proxy_url.is_some() {
+                bail!("SOCKS proxy cannot be combined with a bound network device");
+            }
             let proxy_config = match proxy_url {
                 Some(pu) => Some(
                     SocksProxyConfig::parse(pu)
@@ -670,6 +721,11 @@ impl Session {
                     #[cfg(not(windows))]
                     if let Some(bd) = opts.bind_device_name.as_ref() {
                         b = b.interface(bd);
+                    }
+                    if let Some(resolver) = resolver.as_ref() {
+                        b = b.dns_resolver(Arc::new(ReqwestDnsResolver {
+                            inner: resolver.clone(),
+                        }));
                     }
                     b
                 };
@@ -730,6 +786,9 @@ impl Session {
                 }
             };
 
+            let initial_announce_port = listen_result.as_ref().and_then(|l| l.announce_port);
+            let (announce_port_tx, _) = watch::channel(initial_announce_port);
+
             let session = Arc::new(Self {
                 persistence,
                 bitv_factory,
@@ -742,11 +801,13 @@ impl Session {
                 db: RwLock::new(Default::default()),
                 _cancellation_token_drop_guard: token.clone().drop_guard(),
                 cancellation_token: token,
-                announce_port: listen_result.as_ref().and_then(|l| l.announce_port),
+                announce_port: AtomicU16::new(initial_announce_port.unwrap_or(0)),
+                announce_port_tx,
                 listen_addr: listen_result.as_ref().map(|l| l.addr),
                 disk_write_tx,
                 default_storage_factory: opts.default_storage_factory,
                 reqwest_client,
+                resolver,
                 connector: stream_connector,
                 root_span: opts.root_span,
                 stats: Arc::new(SessionStats::new()),
@@ -931,7 +992,7 @@ impl Session {
 
         loop {
             tokio::select! {
-                r = l.accept() => {
+                r = l.accept(), if should_accept_more_incoming_handshake_checks(futs.len()) => {
                     match r {
                         Ok((addr, (read, write))) => {
                             trace!("accepted connection from {addr}");
@@ -1490,7 +1551,10 @@ impl Session {
             None
         } else {
             self.dht.as_ref().map(|dht| {
-                dht.get_peers(info_hash, if announce { self.announce_port } else { None })
+                dht.get_peers(
+                    info_hash,
+                    if announce { self.announce_port() } else { None },
+                )
             })
         };
 
@@ -1498,7 +1562,10 @@ impl Session {
             None
         } else {
             self.lsd.as_ref().map(|lsd| {
-                lsd.announce(info_hash, if announce { self.announce_port } else { None })
+                lsd.announce(
+                    info_hash,
+                    if announce { self.announce_port() } else { None },
+                )
             })
         };
 
@@ -1526,9 +1593,10 @@ impl Session {
             trackers.into_iter().collect(),
             Box::new(tracker_rx_stats),
             force_tracker_interval,
-            self.announce_port().unwrap_or(4240),
+            self.announce_port_tx.subscribe(),
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
+            self.resolver.clone(),
         );
 
         let initial_peers_rx = if initial_peers.is_empty() {
@@ -1581,7 +1649,16 @@ impl Session {
     }
 
     pub fn announce_port(&self) -> Option<u16> {
+        match self.announce_port.load(Ordering::SeqCst) {
+            0 => None,
+            port => Some(port),
+        }
+    }
+
+    pub fn set_announce_port(&self, announce_port: Option<u16>) {
         self.announce_port
+            .store(announce_port.unwrap_or(0), Ordering::SeqCst);
+        let _ = self.announce_port_tx.send(announce_port);
     }
 
     async fn resolve_magnet(
@@ -1757,11 +1834,34 @@ impl tracker_comms::TorrentStatsProvider for PeerRxTorrentInfo {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use buffers::ByteBuf;
     use itertools::Itertools;
     use librqbit_core::torrent_metainfo::{TorrentMetaV1, torrent_from_bytes};
 
-    use super::torrent_file_from_info_bytes;
+    use super::{
+        MAX_PENDING_INCOMING_HANDSHAKES, Session, SessionOptions,
+        should_accept_more_incoming_handshake_checks, torrent_file_from_info_bytes,
+    };
+
+    #[tokio::test]
+    async fn bound_session_requires_dns_server() {
+        let result = Session::new_with_opts(
+            PathBuf::new(),
+            SessionOptions {
+                bind_device_name: Some("definitely-not-an-interface".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let error = match result {
+            Ok(_) => panic!("bound session unexpectedly started without a DNS server"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("dns_server is required"));
+    }
 
     #[test]
     fn test_torrent_file_from_info_and_bytes() {
@@ -1783,5 +1883,19 @@ mod tests {
         assert_eq!(parsed.info_hash, generated_parsed.info_hash);
         assert_eq!(parsed.info, generated_parsed.info);
         assert_eq!(parsed_trackers, get_trackers(&generated_parsed));
+    }
+
+    #[test]
+    fn test_incoming_handshake_backlog_cap() {
+        assert!(should_accept_more_incoming_handshake_checks(0));
+        assert!(should_accept_more_incoming_handshake_checks(
+            MAX_PENDING_INCOMING_HANDSHAKES - 1
+        ));
+        assert!(!should_accept_more_incoming_handshake_checks(
+            MAX_PENDING_INCOMING_HANDSHAKES
+        ));
+        assert!(!should_accept_more_incoming_handshake_checks(
+            MAX_PENDING_INCOMING_HANDSHAKES + 1
+        ));
     }
 }
