@@ -63,6 +63,8 @@ struct StreamState {
     /// yielded first in the stream's queue, before the normal lookahead pieces.
     /// This is used for seek prioritization without affecting other streams.
     priority_pieces: Option<Vec<ValidPieceIndex>>,
+    /// Optional per-reader cap for both priority and ordinary lookahead.
+    read_ahead_limit: Option<usize>,
     /// The starting piece of the current priority window (for rolling updates)
     priority_window_start: Option<u32>,
     /// Whether this stream has started playing (past cold start)
@@ -72,6 +74,16 @@ struct StreamState {
 }
 
 impl StreamState {
+    fn rolling_window_size(&self) -> u32 {
+        let default = if self.is_playing {
+            STEADY_STATE_PRIORITY_PIECES
+        } else {
+            COLD_START_PRIORITY_PIECES
+        };
+        self.read_ahead_limit
+            .map_or(default, |limit| default.min(limit as u32))
+    }
+
     fn current_piece(&self, lengths: &Lengths) -> Option<CurrentPiece> {
         lengths.compute_current_piece(self.position, self.file_abs_offset)
     }
@@ -91,7 +103,10 @@ impl StreamState {
 
         let normal_pieces: Vec<_> = (start_id..end_id)
             .filter_map(|i| lengths.validate_piece_index(i))
-            .take(piece_limit)
+            .take(
+                self.read_ahead_limit
+                    .map_or(piece_limit, |limit| piece_limit.min(limit)),
+            )
             .collect();
         normal_pieces.into_iter()
     }
@@ -600,7 +615,12 @@ impl TorrentStreams {
             );
 
             let state = s.value_mut();
-            state.priority_pieces = pieces;
+            state.priority_pieces = pieces.map(|mut pieces| {
+                if let Some(limit) = state.read_ahead_limit {
+                    pieces.truncate(limit);
+                }
+                pieces
+            });
 
             // If we're setting new priority pieces, anchor the rolling window to the first piece
             // so that subsequent seek() calls don't immediately overwrite these carefully chosen pieces.
@@ -618,6 +638,18 @@ impl TorrentStreams {
                 "set_stream_priority: stream not found in DashMap!"
             );
         }
+    }
+
+    fn set_read_ahead_limit(&self, stream_id: StreamId, limit: Option<usize>) {
+        if let Some(mut state) = self.streams.get_mut(&stream_id) {
+            state.read_ahead_limit = limit.map(|limit| limit.clamp(1, u32::MAX as usize));
+            if let Some(limit) = state.read_ahead_limit {
+                if let Some(pieces) = state.priority_pieces.as_mut() {
+                    pieces.truncate(limit);
+                }
+            }
+        }
+        self.new_pieces_notify.notify_waiters();
     }
 
     /// Get all priority pieces from all streams. This returns the actual
@@ -675,7 +707,7 @@ impl TorrentStreams {
             state.is_playing = false; // Will become true after COLD_START_PRIORITY_PIECES
 
             // Set initial priority window
-            let window_size = COLD_START_PRIORITY_PIECES;
+            let window_size = state.rolling_window_size();
             let mut new_priority: Vec<ValidPieceIndex> = Vec::with_capacity(window_size as usize);
 
             for i in 0..window_size {
@@ -1081,6 +1113,7 @@ impl ManagedTorrent {
                 file_len: fd_len,
                 file_abs_offset: fd_offset,
                 priority_pieces: None,
+                read_ahead_limit: None,
                 priority_window_start: None,
                 is_playing: false,
                 last_activity: Instant::now(),
@@ -1169,11 +1202,7 @@ impl FileStream {
                 }
 
                 // Calculate new priority window
-                let window_size = if state.is_playing {
-                    STEADY_STATE_PRIORITY_PIECES
-                } else {
-                    COLD_START_PRIORITY_PIECES
-                };
+                let window_size = state.rolling_window_size();
 
                 let mut new_priority: Vec<ValidPieceIndex> =
                     Vec::with_capacity(window_size as usize);
@@ -1250,7 +1279,7 @@ impl FileStream {
             state.is_playing = false; // Will become true after advancing past cold start
 
             // Calculate initial priority window
-            let window_size = COLD_START_PRIORITY_PIECES;
+            let window_size = state.rolling_window_size();
             let mut new_priority: Vec<ValidPieceIndex> = Vec::with_capacity(window_size as usize);
 
             for i in 0..window_size {
@@ -1272,6 +1301,13 @@ impl FileStream {
         }
     }
 
+    /// Bound this reader's priority and ordinary lookahead in pieces, including
+    /// rolling updates after seeks. None restores the default playback policy.
+    /// This does not alter sibling readers or global background downloading.
+    pub fn set_read_ahead_limit(&self, pieces: Option<usize>) {
+        self.streams.set_read_ahead_limit(self.stream_id, pieces);
+    }
+
     pub fn len(&self) -> u64 {
         self.file_len
     }
@@ -1291,5 +1327,76 @@ impl FileStream {
     /// and call `set_priority(Some(vec![target_piece, target_piece + 1]))`.
     pub fn set_priority(&self, pieces: Option<Vec<ValidPieceIndex>>) {
         self.streams.set_stream_priority(self.stream_id, pieces);
+    }
+}
+
+#[cfg(test)]
+mod read_ahead_tests {
+    use super::*;
+
+    fn state() -> StreamState {
+        StreamState {
+            file_id: 0,
+            file_len: 100 * 1024 * 1024,
+            file_abs_offset: 0,
+            position: 0,
+            waker: None,
+            priority_pieces: None,
+            read_ahead_limit: None,
+            priority_window_start: None,
+            is_playing: false,
+            last_activity: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn reader_budget_survives_priority_updates_and_does_not_limit_siblings() {
+        let lengths = Lengths::new(100 * 1024 * 1024, 1024 * 1024).unwrap();
+        let streams = TorrentStreams::default();
+        streams.streams.insert(1, state());
+        streams.streams.insert(2, state());
+        streams.set_read_ahead_limit(1, Some(2));
+        for piece in [0, 12, 50, 8] {
+            streams.enable_rolling_priority(1, piece, &lengths);
+            streams.enable_rolling_priority(2, piece, &lengths);
+            let mut narrow = streams.streams.get_mut(&1).unwrap();
+            narrow.position = u64::from(piece) * 1024 * 1024;
+            narrow.is_playing = true;
+            assert_eq!(narrow.rolling_window_size(), 2);
+            assert_eq!(narrow.priority_pieces.as_ref().unwrap().len(), 2);
+            assert_eq!(narrow.queue_without_priority(&lengths).count(), 2);
+            let ordinary = streams.streams.get(&2).unwrap();
+            assert_eq!(
+                ordinary.priority_pieces.as_ref().unwrap().len(),
+                COLD_START_PRIORITY_PIECES as usize
+            );
+            assert!(ordinary.queue_without_priority(&lengths).count() > 2);
+        }
+        streams.set_stream_priority(
+            1,
+            Some(
+                (0..20)
+                    .map(|p| lengths.validate_piece_index(p).unwrap())
+                    .collect(),
+            ),
+        );
+        assert_eq!(
+            streams
+                .streams
+                .get(&1)
+                .unwrap()
+                .priority_pieces
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+        streams.set_read_ahead_limit(1, None);
+        assert_eq!(
+            streams.streams.get(&1).unwrap().rolling_window_size(),
+            STEADY_STATE_PRIORITY_PIECES
+        );
+        streams.drop_stream(1);
+        assert_eq!(streams.stream_count(), 1);
     }
 }
