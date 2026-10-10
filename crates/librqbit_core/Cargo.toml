@@ -13,6 +13,7 @@ readme = "README.md"
 default = ["sha1-crypto-hash"]
 sha1-crypto-hash = ["sha1w/sha1-crypto-hash"]
 sha1-ring = ["sha1w/sha1-ring"]
+sha1-rustcrypto = ["sha1w/sha1-rustcrypto"]
 
 [dependencies]
 tracing.workspace = true

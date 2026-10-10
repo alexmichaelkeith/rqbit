@@ -14,8 +14,11 @@ readme = "README.md"
 default = ["sha1-crypto-hash"]
 sha1-crypto-hash = ["crypto-hash"]
 sha1-ring = ["aws-lc-rs"]
+sha1-rustcrypto = ["dep:sha1", "dep:sha2"]
 
 [dependencies]
 assert_cfg.workspace = true
 crypto-hash = { workspace = true, optional = true }
 aws-lc-rs = { workspace = true, optional = true }
+sha1 = { version = "0.10", optional = true }
+sha2 = { version = "0.10", optional = true }

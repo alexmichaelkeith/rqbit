@@ -28,6 +28,9 @@ default-tls = [
 miri = []
 prometheus = ["metrics-exporter-prometheus"]
 rust-tls = ["reqwest/rustls-tls", "sha1w/sha1-ring", "librqbit-core/sha1-ring"]
+# Embedders install their own Rustls provider and select hashing separately.
+rust-tls-no-provider = ["reqwest/rustls-tls-webpki-roots-no-provider"]
+sha1-rustcrypto = ["sha1w/sha1-rustcrypto", "librqbit-core/sha1-rustcrypto"]
 storage_middleware = ["lru"]
 storage_examples = []
 tracing-subscriber-utils = ["tracing-subscriber"]
@@ -118,6 +121,9 @@ windows = { workspace = true, features = ["Win32", "Win32_System", "Win32_System
 anyhow.workspace = true
 
 [dev-dependencies]
+# Exercise the provider-free embedding configuration with the same explicit
+# provider used by OpenPVR. This does not select a provider for library users.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 tracing-subscriber = { workspace = true, features = ["fmt", "std"] }
 tokio-test.workspace = true
 tempfile.workspace = true

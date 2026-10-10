@@ -13,6 +13,8 @@ use tempfile::TempDir;
 use tracing::{info, trace};
 
 pub fn setup_test_logging() {
+    #[cfg(feature = "rust-tls-no-provider")]
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     if std::env::var("RUST_LOG").is_err() {
         unsafe { std::env::set_var("RUST_LOG", "info") };
     }
