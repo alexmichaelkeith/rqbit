@@ -20,15 +20,19 @@ than patching the engine in OpenPVR.
 - **Piece demand:** exact reader-owned and application-owned piece lists,
   independent reader budgets, wakeups when demand changes, and explicit
   background completion. OpenPVR translates byte demand into pieces without
-  asking rqbit to infer playback policy.
+  asking rqbit to infer playback policy. Unchanged updates do not wake peers;
+  named demand reconnects idle peers only when it introduces new pieces.
 - **Administrative progress:** exported `FileStream`, piece indices and
-  piece-state/bitmap notifications support OpenPVR's admin diagnostics.
+  `PieceSnapshot`/bitmap notifications support OpenPVR's admin diagnostics.
+  The snapshot supplies availability, scheduling state and piece length in
+  one read; the cheap bitmap accessor remains for availability checks.
 - **VPN DNS:** bind tracker and DHT DNS lookups to the selected device and
   configured DNS server. Fail session creation if a bound device lacks a DNS
   server, and reject combining device binding with a SOCKS proxy.
 - **Port forwarding:** update the announced port while a session is running
   and wake tracker announcements when it changes. OpenPVR uses this when a
-  forwarded VPN port changes.
+  forwarded VPN port changes. The watch channel is the sole port state and
+  retains updates even before any tracker subscribes.
 - **Independent crypto selection:** `rust-tls-no-provider` lets the embedding
   app install its Rustls provider, while `sha1-rustcrypto` selects RustCrypto
   hashing with CPU intrinsics independently of TLS.

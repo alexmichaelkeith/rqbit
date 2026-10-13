@@ -55,6 +55,27 @@ use self::paused::TorrentStatePaused;
 pub use self::stats::{TorrentStats, TorrentStatsState};
 pub use self::streaming::FileStream;
 
+/// Piece availability and demand captured for administrative inspection.
+#[derive(Debug)]
+pub struct PieceSnapshot {
+    /// 0 = empty, 1 = verified, 2 = queued, 3 = in-flight.
+    pub states: Vec<u8>,
+    pub priority_pieces: Vec<u32>,
+    pub piece_length: u32,
+}
+
+impl PieceSnapshot {
+    fn from_have(have: &crate::type_aliases::BS, lengths: &Lengths) -> Self {
+        Self {
+            states: (0..lengths.total_pieces() as usize)
+                .map(|index| u8::from(have.get(index).is_some_and(|bit| *bit)))
+                .collect(),
+            priority_pieces: Vec::new(),
+            piece_length: lengths.default_piece_length(),
+        }
+    }
+}
+
 // State machine transitions.
 //
 // - error -> initializing
@@ -593,29 +614,16 @@ impl ManagedTorrent {
         })
     }
 
-    /// Get detailed per-piece state array with in-flight and queued info.
-    /// Returns (states_vec, priority_piece_indices) where states are:
-    ///   0 = empty, 1 = have, 2 = queued, 3 = in-flight
-    pub fn get_piece_states(&self) -> Option<(Vec<u8>, Vec<u32>)> {
-        self.with_state(|s| {
-            match s {
-                ManagedTorrentState::Live(l) => l.get_piece_states(),
-                ManagedTorrentState::Paused(p) => {
-                    // Paused: only have data, no in-flight or queued
-                    let lengths = p.metadata.lengths();
-                    let total = lengths.total_pieces() as usize;
-                    let have = p.chunk_tracker.get_have_pieces();
-                    let slice = have.as_slice();
-                    let mut states = vec![0u8; total];
-                    for i in 0..total {
-                        if slice[i] {
-                            states[i] = 1;
-                        }
-                    }
-                    Some((states, Vec::new()))
-                }
-                _ => None,
-            }
+    /// Capture verified, queued and in-flight pieces with their piece length.
+    /// Verification and scheduling state are read under the same state lock.
+    pub fn get_piece_snapshot(&self) -> Option<PieceSnapshot> {
+        self.with_state(|s| match s {
+            ManagedTorrentState::Live(l) => l.get_piece_snapshot(),
+            ManagedTorrentState::Paused(p) => Some(PieceSnapshot::from_have(
+                p.chunk_tracker.get_have_pieces().as_slice(),
+                p.metadata.lengths(),
+            )),
+            _ => None,
         })
     }
 

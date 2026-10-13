@@ -721,27 +721,17 @@ impl TorrentStateLive {
             .map(|c| *c.get_hns())
     }
 
-    /// Returns per-piece download state and the priority pieces requested by
-    /// active streams. States are 0 = empty, 1 = have, 2 = queued, and
-    /// 3 = in-flight.
-    pub fn get_piece_states(&self) -> Option<(Vec<u8>, Vec<u32>)> {
-        let g = self.lock_read("get_piece_states");
+    pub fn get_piece_snapshot(&self) -> Option<super::PieceSnapshot> {
+        let g = self.lock_read("get_piece_snapshot");
         let pieces = g.get_pieces().ok()?;
         let chunks = pieces.chunks();
-        let total = self.lengths.total_pieces() as usize;
-        let mut states = vec![0u8; total];
-
-        let have = chunks.get_have_pieces().as_slice();
-        for (index, state) in states.iter_mut().enumerate() {
-            if have.get(index).as_deref() == Some(&true) {
-                *state = 1;
-            }
-        }
+        let mut snapshot =
+            super::PieceSnapshot::from_have(chunks.get_have_pieces().as_slice(), &self.lengths);
 
         for piece in pieces.iter_inflight_pieces() {
             let index = piece.get_usize();
-            if states.get(index) == Some(&0) {
-                states[index] = 3;
+            if snapshot.states.get(index) == Some(&0) {
+                snapshot.states[index] = 3;
             }
         }
 
@@ -756,19 +746,19 @@ impl TorrentStateLive {
             .chain(chunks.iter_queued_pieces(file_priorities, &self.metadata.file_infos))
         {
             let index = piece.get_usize();
-            if states.get(index) == Some(&0) {
-                states[index] = 2;
+            if snapshot.states.get(index) == Some(&0) {
+                snapshot.states[index] = 2;
             }
         }
 
-        let priority = self
+        snapshot.priority_pieces = self
             .streams
             .get_all_priority_pieces()
             .into_iter()
             .map(|piece| piece.get())
             .collect();
 
-        Some((states, priority))
+        Some(snapshot)
     }
 
     fn transmit_haves(&self, index: ValidPieceIndex) {
@@ -1620,12 +1610,7 @@ impl PeerHandler {
             .state
             .lengths
             .validate_piece_index(have)
-            .is_some_and(|piece| {
-                self.state
-                    .streams
-                    .get_all_priority_pieces()
-                    .contains(&piece)
-            })
+            .is_some_and(|piece| self.state.streams.is_piece_requested(piece))
         {
             self.state.streams.new_pieces_notify.notify_waiters();
         }

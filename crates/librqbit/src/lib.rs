@@ -97,8 +97,8 @@ pub use session::{
 };
 pub use stream_connect::ConnectionOptions;
 pub use torrent_state::{
-    FileStream, ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata,
-    TorrentStats, TorrentStatsState,
+    FileStream, ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, PieceSnapshot,
+    TorrentMetadata, TorrentStats, TorrentStatsState,
 };
 pub use type_aliases::FileInfos;
 

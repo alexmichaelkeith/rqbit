@@ -6,7 +6,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU16, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -114,7 +114,6 @@ pub struct Session {
 
     // Network
     peer_id: Id20,
-    announce_port: AtomicU16,
     announce_port_tx: watch::Sender<Option<u16>>,
     listen_addr: Option<SocketAddr>,
     dht: Option<Dht>,
@@ -835,7 +834,10 @@ impl Session {
                 }
             };
 
-            let initial_announce_port = listen_result.as_ref().and_then(|l| l.announce_port);
+            let initial_announce_port = listen_result
+                .as_ref()
+                .and_then(|l| l.announce_port)
+                .filter(|port| *port != 0);
             let (announce_port_tx, _) = watch::channel(initial_announce_port);
 
             let session = Arc::new(Self {
@@ -850,7 +852,6 @@ impl Session {
                 db: RwLock::new(Default::default()),
                 _cancellation_token_drop_guard: token.clone().drop_guard(),
                 cancellation_token: token,
-                announce_port: AtomicU16::new(initial_announce_port.unwrap_or(0)),
                 announce_port_tx,
                 listen_addr: listen_result.as_ref().map(|l| l.addr),
                 default_storage_factory: opts.default_storage_factory,
@@ -1706,16 +1707,18 @@ impl Session {
     }
 
     pub fn announce_port(&self) -> Option<u16> {
-        match self.announce_port.load(Ordering::SeqCst) {
-            0 => None,
-            port => Some(port),
-        }
+        *self.announce_port_tx.borrow()
     }
 
     pub fn set_announce_port(&self, announce_port: Option<u16>) {
-        self.announce_port
-            .store(announce_port.unwrap_or(0), Ordering::SeqCst);
-        let _ = self.announce_port_tx.send(announce_port);
+        let announce_port = announce_port.filter(|port| *port != 0);
+        self.announce_port_tx.send_if_modified(|current| {
+            if *current == announce_port {
+                return false;
+            }
+            *current = announce_port;
+            true
+        });
     }
 
     async fn resolve_magnet(
@@ -1959,6 +1962,44 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("dns_server is required"));
+    }
+
+    #[tokio::test]
+    async fn announce_port_survives_without_trackers_and_notifies_only_on_change() {
+        crate::tests::test_util::setup_test_logging();
+        let directory = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            directory.path().to_owned(),
+            SessionOptions {
+                dht: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                listen: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // A VPN port can arrive before the first torrent starts a tracker.
+        session.set_announce_port(Some(43123));
+        assert_eq!(session.announce_port(), Some(43123));
+        let mut tracker = session.announce_port_tx.subscribe();
+        assert_eq!(*tracker.borrow_and_update(), Some(43123));
+        session.set_announce_port(Some(43123));
+        assert!(!tracker.has_changed().unwrap());
+        session.set_announce_port(Some(43124));
+        assert!(tracker.has_changed().unwrap());
+        assert_eq!(*tracker.borrow_and_update(), session.announce_port());
+
+        drop(tracker);
+        session.set_announce_port(None);
+        let tracker = session.announce_port_tx.subscribe();
+        assert_eq!(*tracker.borrow(), None);
+        session.set_announce_port(Some(0));
+        assert_eq!(session.announce_port(), None);
+        assert!(!tracker.has_changed().unwrap());
+        session.stop().await;
     }
 
     use super::{is_bare_info_hash, torrent_file_from_info_bytes};

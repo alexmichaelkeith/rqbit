@@ -137,35 +137,83 @@ impl TorrentStreams {
     }
 
     fn set_stream_priority(&self, stream_id: StreamId, pieces: Option<Vec<ValidPieceIndex>>) {
-        if let Some(mut stream) = self.streams.get_mut(&stream_id) {
+        let changed = if let Some(mut stream) = self.streams.get_mut(&stream_id)
+            && stream.priority_pieces != pieces
+        {
             stream.priority_pieces = pieces;
-        }
+            true
+        } else {
+            false
+        };
         // Wake after releasing the map guard; peers read the same demand map.
-        self.new_pieces_notify.notify_waiters();
+        if changed {
+            self.new_pieces_notify.notify_waiters();
+        }
     }
 
     fn set_read_ahead_limit(&self, stream_id: StreamId, pieces: Option<usize>) {
-        if let Some(mut stream) = self.streams.get_mut(&stream_id) {
-            stream.read_ahead_limit = pieces.map(|n| n.max(1));
+        let pieces = pieces.map(|n| n.max(1));
+        let changed = if let Some(mut stream) = self.streams.get_mut(&stream_id)
+            && stream.read_ahead_limit != pieces
+        {
+            stream.read_ahead_limit = pieces;
+            true
+        } else {
+            false
+        };
+        if changed {
+            self.new_pieces_notify.notify_waiters();
         }
-        self.new_pieces_notify.notify_waiters();
     }
 
-    fn set_piece_demand(&self, owner: String, pieces: Option<Vec<ValidPieceIndex>>) {
-        match pieces {
-            Some(pieces) => {
-                self.piece_demands.insert(owner, pieces);
+    /// Returns whether new pieces were introduced and idle peers may be useful.
+    fn set_piece_demand(&self, owner: String, pieces: Option<Vec<ValidPieceIndex>>) -> bool {
+        use dashmap::mapref::entry::Entry;
+
+        let Some(pieces) = pieces.filter(|pieces| !pieces.is_empty()) else {
+            if self.piece_demands.remove(&owner).is_some() {
+                self.new_pieces_notify.notify_waiters();
             }
-            None => {
-                self.piece_demands.remove(&owner);
+            return false;
+        };
+        let reconnect = match self.piece_demands.entry(owner) {
+            Entry::Occupied(mut entry) => {
+                if entry.get() == &pieces {
+                    return false;
+                }
+                let reconnect = pieces.iter().any(|piece| !entry.get().contains(piece));
+                entry.insert(pieces);
+                reconnect
             }
-        }
+            Entry::Vacant(entry) => {
+                entry.insert(pieces);
+                true
+            }
+        };
         self.new_pieces_notify.notify_waiters();
+        reconnect
     }
 
     fn clear_piece_demands(&self) {
-        self.piece_demands.clear();
-        self.new_pieces_notify.notify_waiters();
+        if !self.piece_demands.is_empty() {
+            self.piece_demands.clear();
+            self.new_pieces_notify.notify_waiters();
+        }
+    }
+
+    pub(crate) fn is_piece_requested(&self, piece: ValidPieceIndex) -> bool {
+        self.streams.iter().any(|stream| {
+            stream
+                .priority_pieces
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .take(stream.read_ahead_limit.unwrap_or(usize::MAX))
+                .any(|requested| *requested == piece)
+        }) || self
+            .piece_demands
+            .iter()
+            .any(|demand| demand.contains(&piece))
     }
 
     pub(crate) fn get_all_priority_pieces(&self) -> Vec<ValidPieceIndex> {
@@ -211,7 +259,9 @@ impl TorrentStreams {
     fn drop_stream(&self, stream_id: StreamId) -> Option<StreamState> {
         debug!(stream_id, "dropping stream");
         let removed = self.streams.remove(&stream_id).map(|s| s.1);
-        self.new_pieces_notify.notify_waiters();
+        if removed.is_some() {
+            self.new_pieces_notify.notify_waiters();
+        }
         removed
     }
 
@@ -400,16 +450,6 @@ impl ManagedTorrent {
         })
     }
 
-    /// Replace the exact pieces requested by this live reader.
-    pub fn set_priority_for_stream(
-        &self,
-        stream_id: usize,
-        pieces: Option<Vec<ValidPieceIndex>>,
-    ) -> anyhow::Result<()> {
-        self.streams()?.set_stream_priority(stream_id, pieces);
-        Ok(())
-    }
-
     /// Replace demand owned by the embedding application. Owners must release
     /// their demand explicitly; the engine does not guess playback lifetimes.
     pub fn set_piece_demand(
@@ -417,12 +457,13 @@ impl ManagedTorrent {
         owner: String,
         pieces: Option<Vec<ValidPieceIndex>>,
     ) -> anyhow::Result<()> {
-        self.streams()?.set_piece_demand(owner, pieces);
-        self.with_state(|state| {
-            if let crate::ManagedTorrentState::Live(l) = state {
-                l.reconnect_all_not_needed_peers();
-            }
-        });
+        if self.streams()?.set_piece_demand(owner, pieces) {
+            self.with_state(|state| {
+                if let crate::ManagedTorrentState::Live(l) = state {
+                    l.reconnect_all_not_needed_peers();
+                }
+            });
+        }
         Ok(())
     }
 
@@ -528,17 +569,15 @@ impl FileStream {
 
     fn set_position(&mut self, new_pos: u64) {
         self.position = new_pos;
-        self.streams
-            .streams
-            .get_mut(&self.stream_id)
-            .unwrap()
-            .value_mut()
-            .position = new_pos;
-        self.streams.new_pieces_notify.notify_waiters();
-    }
-
-    pub fn stream_id(&self) -> usize {
-        self.stream_id
+        let changed = {
+            let mut stream = self.streams.streams.get_mut(&self.stream_id).unwrap();
+            let changed = stream.position != new_pos && stream.priority_pieces.is_none();
+            stream.position = new_pos;
+            changed
+        };
+        if changed {
+            self.streams.new_pieces_notify.notify_waiters();
+        }
     }
 
     pub fn set_priority(&self, pieces: Option<Vec<ValidPieceIndex>>) {
@@ -632,7 +671,58 @@ mod demand_tests {
             assert_eq!(streams.streams.get(&1).unwrap().queue(&lengths).count(), 2);
             assert_eq!(streams.streams.get(&2).unwrap().queue(&lengths).count(), 5);
         }
+        streams.drop_stream(2);
+        let piece = |i| lengths.validate_piece_index(i).unwrap();
+        assert!(streams.is_piece_requested(piece(8)));
+        assert!(streams.is_piece_requested(piece(9)));
+        assert!(!streams.is_piece_requested(piece(10)));
+        streams.set_piece_demand("viewer:a".into(), Some(vec![piece(10)]));
+        assert!(streams.is_piece_requested(piece(10)));
+        streams.clear_piece_demands();
+        assert!(!streams.is_piece_requested(piece(10)));
         streams.set_read_ahead_limit(1, None);
         assert_eq!(streams.streams.get(&1).unwrap().queue(&lengths).count(), 5);
+    }
+
+    #[tokio::test]
+    async fn unchanged_requests_do_not_wake_peers_and_release_does_not_reconnect() {
+        let lengths = Lengths::new(100 * 1024 * 1024, 1024 * 1024).unwrap();
+        let streams = TorrentStreams::default();
+        let pieces = |ids: &[u32]| {
+            ids.iter()
+                .map(|&i| lengths.validate_piece_index(i).unwrap())
+                .collect()
+        };
+        streams.streams.insert(1, reader());
+        streams.set_stream_priority(1, Some(pieces(&[2, 3])));
+        streams.set_read_ahead_limit(1, Some(2));
+        assert!(streams.set_piece_demand("viewer:a".into(), Some(pieces(&[50, 51]))));
+
+        let wake = streams.new_pieces_notify.notified();
+        tokio::pin!(wake);
+        assert!(futures::poll!(wake.as_mut()).is_pending());
+        streams.set_stream_priority(1, Some(pieces(&[2, 3])));
+        streams.set_read_ahead_limit(1, Some(2));
+        assert!(!streams.set_piece_demand("viewer:a".into(), Some(pieces(&[50, 51]))));
+        assert!(futures::poll!(wake.as_mut()).is_pending());
+        // Reordering changes scheduling, but gives idle peers no new pieces.
+        assert!(!streams.set_piece_demand("viewer:a".into(), Some(pieces(&[51, 50]))));
+        assert!(futures::poll!(wake.as_mut()).is_ready());
+
+        let wake = streams.new_pieces_notify.notified();
+        tokio::pin!(wake);
+        assert!(futures::poll!(wake.as_mut()).is_pending());
+        assert!(!streams.set_piece_demand("viewer:a".into(), None));
+        assert!(futures::poll!(wake.as_mut()).is_ready());
+
+        let wake = streams.new_pieces_notify.notified();
+        tokio::pin!(wake);
+        assert!(futures::poll!(wake.as_mut()).is_pending());
+        assert!(!streams.set_piece_demand("viewer:a".into(), None));
+        assert!(!streams.set_piece_demand("viewer:b".into(), Some(Vec::new())));
+        streams.clear_piece_demands();
+        assert!(futures::poll!(wake.as_mut()).is_pending());
+        assert!(streams.set_piece_demand("viewer:a".into(), Some(pieces(&[80]))));
+        assert!(futures::poll!(wake.as_mut()).is_ready());
     }
 }
