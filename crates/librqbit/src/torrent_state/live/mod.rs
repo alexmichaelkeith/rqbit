@@ -745,7 +745,16 @@ impl TorrentStateLive {
             }
         }
 
-        for piece in chunks.iter_queued_pieces(&g.file_priorities, &self.metadata.file_infos) {
+        let file_priorities = if self.streams.background_download_enabled() {
+            g.file_priorities.as_slice()
+        } else {
+            &[]
+        };
+        for piece in self
+            .streams
+            .iter_next_pieces(&self.lengths)
+            .chain(chunks.iter_queued_pieces(file_priorities, &self.metadata.file_infos))
+        {
             let index = piece.get_usize();
             if states.get(index) == Some(&0) {
                 states[index] = 2;
@@ -1485,9 +1494,7 @@ impl PeerHandler {
                     ..
                 } = &mut **g;
                 let pieces = pieces.as_mut().ok_or(Error::ChunkTrackerEmpty)?;
-                let file_priorities = if self.state.streams.has_streaming_context()
-                    && !self.state.streams.background_download_enabled()
-                {
+                let file_priorities = if !self.state.streams.background_download_enabled() {
                     &[][..]
                 } else {
                     file_priorities.as_slice()
