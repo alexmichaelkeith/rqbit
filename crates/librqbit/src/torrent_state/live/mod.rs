@@ -751,13 +751,6 @@ impl TorrentStateLive {
             }
         }
 
-        snapshot.priority_pieces = self
-            .streams
-            .get_all_priority_pieces()
-            .into_iter()
-            .map(|piece| piece.get())
-            .collect();
-
         Some(snapshot)
     }
 

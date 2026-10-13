@@ -6,8 +6,8 @@ queue and exposes background completion. OpenPVR owns read windows, consumer
 budgets, fairness, deduplication and demand leases. The engine contains no
 viewer IDs or per-reader priority controls. Ordinary rqbit readers retain
 upstream lookahead when no caller-controlled queue is supplied.
-`examples/local_playback_seed.rs` provides a loopback-only seeder
-and tracker for a generated video; it disables DHT and LAN discovery.
+OpenPVR's `examples/local_torrent_seed.rs` provides the loopback-only seeder
+and tracker used for playback checks; the fixture stays with the application.
 
 The `openpvr/upstream-20261012` integration branch includes upstream
 `ikatson/rqbit` main through `57e95d16c830863a1fde32d8fa98153b53a3d0b4` (9.0.1), fetched on 2026-10-12.
@@ -21,10 +21,13 @@ librqbit inline in OpenPVR; application policy belongs in OpenPVR.
   requests, and explicit background completion. `Some(empty)` requests no
   pieces; `None` restores upstream reader scheduling. OpenPVR owns all
   consumer coordination and releases demand on scope exit or cancellation.
-- **Administrative progress:** exported `FileStream`, piece indices and
-  `PieceSnapshot`/bitmap notifications support OpenPVR's admin diagnostics.
-  The snapshot supplies availability, scheduling state and piece length in
-  one read; the cheap bitmap accessor remains for availability checks.
+- **Piece inspection:** exported `FileStream`, piece indices and
+  `PieceSnapshot` support embedding and diagnostics. The snapshot supplies
+  verified, queued and in-flight states with piece length in one read.
+  OpenPVR uses upstream `Api::api_dump_haves` for compact bitfields and
+  `TorrentStorage::on_piece_completed` for notifications. Requested-piece
+  highlighting belongs to OpenPVR; the fork has no custom bitmap accessor,
+  notification channel or completion subscription API.
 - **DNS injection:** a generic `HostResolver` supplied by the embedding app
   is used for HTTP/UDP trackers and DHT bootstrap, without system-DNS fallback
   on errors. OpenPVR owns interface-bound DNS, its parser and validation.
@@ -51,6 +54,25 @@ Upstream's configurable handshake limit already replaces the old fixed cap.
 The pre-9.0 `PersistentDhtConfig`, `disable_dht`, `dht_config`, and
 `dht_bootstrap_addrs` compatibility fields are also removed. OpenPVR now uses
 upstream `DhtSessionConfig` and `DhtPersistenceConfig` directly.
+
+## Preparing upstream contributions
+
+Prepare independent patches for uTP dependency hardening, provider-free TLS,
+the RustCrypto hashing backend, live announce-port updates, generic DNS
+injection, piece inspection and caller-controlled piece scheduling. Preserve
+upstream defaults and keep application fixtures and this fork's documentation
+out of those patches. Discuss scheduling API shape before proposing it.
+
+Coordinate piece inspection with existing upstream bitfield/progress work
+(PRs #574 and #650). A compact bitfield API and storage completion callback
+already exist; do not add competing APIs for those capabilities. Include
+default-feature and supported-platform checks in addition to OpenPVR's
+provider-free configuration. Local Mac/OpenPVR checks alone do not qualify
+every upstream binary, desktop app or feature combination.
+
+Upstream requires AI-assistance disclosure and human review/understanding;
+see https://github.com/ikatson/rqbit/blob/main/AI_POLICY.md. No upstream
+submission or remote push is part of this local experiment.
 
 ## Updating again
 

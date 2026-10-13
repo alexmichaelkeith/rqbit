@@ -16,7 +16,7 @@ use parking_lot::RwLock;
 use librqbit_core::lengths::{CurrentPiece, Lengths, ValidPieceIndex};
 use tokio::{
     io::{AsyncRead, AsyncSeek},
-    sync::{Notify, OwnedSemaphorePermit, broadcast},
+    sync::{Notify, OwnedSemaphorePermit},
 };
 use tracing::{debug, trace};
 
@@ -56,19 +56,16 @@ pub(crate) struct TorrentStreams {
     next_stream_id: AtomicUsize,
     streams: DashMap<StreamId, StreamState>,
     requested_pieces: RwLock<Option<Arc<[ValidPieceIndex]>>>,
-    piece_completed_tx: broadcast::Sender<u32>,
     pub(crate) new_pieces_notify: Notify,
     background_download: AtomicBool,
 }
 
 impl Default for TorrentStreams {
     fn default() -> Self {
-        let (piece_completed_tx, _) = broadcast::channel(256);
         Self {
             next_stream_id: AtomicUsize::new(0),
             streams: DashMap::new(),
             requested_pieces: RwLock::new(None),
-            piece_completed_tx,
             new_pieces_notify: Notify::new(),
             // Ordinary rqbit downloads retain upstream's completion behavior.
             background_download: AtomicBool::new(true),
@@ -145,14 +142,6 @@ impl TorrentStreams {
             .as_deref()
             .is_some_and(|pieces| pieces.contains(&piece))
     }
-    pub(crate) fn get_all_priority_pieces(&self) -> Vec<ValidPieceIndex> {
-        self.requested_pieces
-            .read()
-            .as_deref()
-            .unwrap_or_default()
-            .to_vec()
-    }
-
     pub(crate) fn background_download_enabled(&self) -> bool {
         self.background_download.load(Ordering::Relaxed)
     }
@@ -162,7 +151,6 @@ impl TorrentStreams {
         piece_id: ValidPieceIndex,
         lengths: &Lengths,
     ) {
-        let _ = self.piece_completed_tx.send(piece_id.get());
         for mut w in self.streams.iter_mut() {
             if w.value().current_piece(lengths).map(|p| p.id) == Some(piece_id)
                 && let Some(waker) = w.value_mut().waker.take()
@@ -399,10 +387,6 @@ impl ManagedTorrent {
             }
         }
         Ok(())
-    }
-
-    pub fn subscribe_piece_completed(&self) -> anyhow::Result<broadcast::Receiver<u32>> {
-        Ok(self.streams()?.piece_completed_tx.subscribe())
     }
 
     fn maybe_reconnect_needed_peers_for_file(&self, file_id: usize) -> bool {
