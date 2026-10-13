@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     io::Read,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
@@ -57,7 +57,7 @@ use itertools::Itertools;
 use librqbit_core::{
     crate_version,
     directories::get_configuration_directory,
-    dns::{BoundDnsResolver, HostResolver},
+    dns::HostResolver,
     magnet::Magnet,
     peer_id::generate_azereus_style,
     spawn_utils::spawn_with_cancel,
@@ -452,9 +452,8 @@ pub struct SessionOptions {
     /// On OSX will use IP(V6)_BOUND_IF, on Linux will use SO_BINDTODEVICE.
     pub bind_device_name: Option<String>,
 
-    /// DNS server used when a network device is selected. DNS requests are
-    /// bound to that device, and session creation fails if this is omitted.
-    pub dns_server: Option<IpAddr>,
+    /// Caller-supplied hostname resolution; errors never fall back to system DNS.
+    pub host_resolver: Option<Arc<dyn HostResolver>>,
 
     /// Disable tracker communication
     pub disable_trackers: bool,
@@ -518,7 +517,7 @@ impl Default for SessionOptions {
         Self {
             dht: Some(DhtSessionConfig::default()),
             bind_device_name: None,
-            dns_server: None,
+            host_resolver: None,
             disable_trackers: false,
             fastresume: false,
             persistence: None,
@@ -613,10 +612,6 @@ impl Session {
                 warn!("uploading disabled");
             }
 
-            if opts.bind_device_name.is_some() && opts.dns_server.is_none() {
-                bail!("dns_server is required when bind_device_name is set");
-            }
-
             let bind_device = match opts.bind_device_name.as_ref() {
                 Some(name) => Some(
                     BindDevice::new_from_name(name)
@@ -624,16 +619,7 @@ impl Session {
                 ),
                 None => None,
             };
-            let resolver: Option<Arc<dyn HostResolver>> =
-                match (bind_device.as_ref(), opts.dns_server) {
-                    (Some(bind_device), Some(server)) => Some(Arc::new(BoundDnsResolver::new(
-                        server,
-                        bind_device.clone(),
-                        opts.ipv4_only,
-                    ))),
-                    (Some(_), None) => unreachable!("validated above"),
-                    (None, _) => None,
-                };
+            let resolver = opts.host_resolver.take();
 
             let listen_result = if let Some(listen_opts) = opts.listen.take() {
                 Some(
@@ -767,12 +753,14 @@ impl Session {
                     if let Some(bd) = opts.bind_device_name.as_ref() {
                         b = b.interface(bd);
                     }
-                    if let Some(resolver) = resolver.as_ref() {
-                        b = b.dns_resolver(Arc::new(ReqwestDnsResolver {
-                            inner: resolver.clone(),
-                        }));
-                    }
                     b
+                };
+                let builder = if let Some(resolver) = resolver.as_ref() {
+                    builder.dns_resolver(Arc::new(ReqwestDnsResolver {
+                        inner: resolver.clone(),
+                    }))
+                } else {
+                    builder
                 };
 
                 builder
@@ -1895,13 +1883,19 @@ impl tracker_comms::TorrentStatsProvider for PeerRxTorrentInfo {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::Duration};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use buffers::ByteBuf;
     use itertools::Itertools;
     use librqbit_core::torrent_metainfo::{TorrentMetaV1, torrent_from_bytes};
 
-    use super::{Session, SessionOptions};
+    use super::{HostResolver, Session, SessionOptions};
 
     #[tokio::test]
     async fn incoming_listener_survives_failed_handshakes_at_backlog_cap() {
@@ -1947,24 +1941,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bound_session_requires_dns_server() {
-        let result = Session::new_with_opts(
-            PathBuf::new(),
-            SessionOptions {
-                bind_device_name: Some("definitely-not-an-interface".to_owned()),
-                ..Default::default()
-            },
-        )
-        .await;
-
-        let error = match result {
-            Ok(_) => panic!("bound session unexpectedly started without a DNS server"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("dns_server is required"));
-    }
-
-    #[tokio::test]
     async fn announce_port_survives_without_trackers_and_notifies_only_on_change() {
         crate::tests::test_util::setup_test_logging();
         let directory = tempfile::tempdir().unwrap();
@@ -1999,6 +1975,44 @@ mod tests {
         session.set_announce_port(Some(0));
         assert_eq!(session.announce_port(), None);
         assert!(!tracker.has_changed().unwrap());
+        session.stop().await;
+    }
+
+    #[tokio::test]
+    async fn injected_http_resolver_errors_do_not_fall_back_to_system_dns() {
+        struct Resolver(Arc<AtomicUsize>);
+        impl HostResolver for Resolver {
+            fn resolve<'a>(&'a self, _: &'a str, _: u16) -> librqbit_core::dns::ResolveFuture<'a> {
+                Box::pin(async move {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                    anyhow::bail!("injected DNS failure")
+                })
+            }
+        }
+        crate::tests::test_util::setup_test_logging();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let directory = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            directory.path().to_owned(),
+            SessionOptions {
+                dht: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                listen: None,
+                host_resolver: Some(Arc::new(Resolver(calls.clone()))),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let error = session
+            .reqwest_client
+            .get("http://resolver.invalid/")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(calls.load(Ordering::Relaxed) > 0);
+        assert!(format!("{error:?}").contains("injected DNS failure"));
         session.stop().await;
     }
 

@@ -1,34 +1,36 @@
 # OpenPVR integration fork
 
 Local experiment: `openpvr/explicit-piece-demand-local` simplifies the published
-integration below. It is not pushed. rqbit accepts exact per-reader and named
-piece lists, interleaves/deduplicates them, and exposes background completion.
-OpenPVR owns byte windows, viewer lifetimes and release. The engine's playback
-anchors, cold/steady-state windows, activity timers and rolling-priority APIs
-are removed. Ordinary readers retain upstream lookahead unless explicit demand
-is supplied. `examples/local_playback_seed.rs` provides a loopback-only seeder
+integration below. It is not pushed. rqbit executes one exact ordered piece
+queue and exposes background completion. OpenPVR owns read windows, consumer
+budgets, fairness, deduplication and demand leases. The engine contains no
+viewer IDs or per-reader priority controls. Ordinary rqbit readers retain
+upstream lookahead when no caller-controlled queue is supplied.
+`examples/local_playback_seed.rs` provides a loopback-only seeder
 and tracker for a generated video; it disables DHT and LAN discovery.
 
 The `openpvr/upstream-20261012` integration branch includes upstream
 `ikatson/rqbit` main through `57e95d16c830863a1fde32d8fa98153b53a3d0b4` (9.0.1), fetched on 2026-10-12.
 OpenPVR's `Cargo.toml` selects the integration branch and its `Cargo.lock`
-records the exact revision. Keep application-specific changes here rather
-than patching the engine in OpenPVR.
+records the exact revision. Keep engine fixes here rather than patching
+librqbit inline in OpenPVR; application policy belongs in OpenPVR.
 
 ## Changes still required by OpenPVR
 
-- **Piece demand:** exact reader-owned and application-owned piece lists,
-  independent reader budgets, wakeups when demand changes, and explicit
-  background completion. OpenPVR translates byte demand into pieces without
-  asking rqbit to infer playback policy. Unchanged updates do not wake peers;
-  named demand reconnects idle peers only when it introduces new pieces.
+- **Piece demand:** one caller-controlled ordered queue, wakeups for changed
+  requests, and explicit background completion. `Some(empty)` requests no
+  pieces; `None` restores upstream reader scheduling. OpenPVR owns all
+  consumer coordination and releases demand on scope exit or cancellation.
 - **Administrative progress:** exported `FileStream`, piece indices and
   `PieceSnapshot`/bitmap notifications support OpenPVR's admin diagnostics.
   The snapshot supplies availability, scheduling state and piece length in
   one read; the cheap bitmap accessor remains for availability checks.
-- **VPN DNS:** bind tracker and DHT DNS lookups to the selected device and
-  configured DNS server. Fail session creation if a bound device lacks a DNS
-  server, and reject combining device binding with a SOCKS proxy.
+- **DNS injection:** a generic `HostResolver` supplied by the embedding app
+  is used for HTTP/UDP trackers and DHT bootstrap, without system-DNS fallback
+  on errors. OpenPVR owns interface-bound DNS, its parser and validation.
+  The standalone CLI retains upstream networking options; the fork's custom
+  `--dns-server` option is retired. OpenPVR still refuses VPN startup without
+  a verified interface and bound DNS server.
 - **Port forwarding:** update the announced port while a session is running
   and wake tracker announcements when it changes. OpenPVR uses this when a
   forwarded VPN port changes. The watch channel is the sole port state and

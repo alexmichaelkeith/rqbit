@@ -104,6 +104,7 @@ pub use type_aliases::FileInfos;
 
 pub use buffers::*;
 pub use clone_to_owned::CloneToOwned;
+pub use librqbit_core::dns::{HostResolver, ResolveFuture};
 pub use librqbit_core::lengths::{Lengths, ValidPieceIndex};
 pub use librqbit_core::magnet::*;
 pub use librqbit_core::peer_id::*;

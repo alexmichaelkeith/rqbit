@@ -216,15 +216,6 @@ struct Opts {
     #[arg(long = "bind-device", env = "RQBIT_BIND_DEVICE")]
     bind_device_name: Option<String>,
 
-    /// DNS server to query through --bind-device. Required when --bind-device
-    /// is set so hostname resolution cannot fall back to the host network.
-    #[arg(
-        long = "dns-server",
-        env = "RQBIT_DNS_SERVER",
-        requires = "bind_device_name"
-    )]
-    dns_server: Option<IpAddr>,
-
     /// Force IPv4 only.
     #[arg(long = "ipv4-only", env = "RQBIT_IPV4_ONLY")]
     ipv4_only: bool,
@@ -666,7 +657,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             }),
         }),
         bind_device_name: opts.bind_device_name.take(),
-        dns_server: opts.dns_server,
+        host_resolver: None,
         default_storage_factory: Some({
             fn wrap<S: StorageFactory + Clone>(s: S) -> impl StorageFactory {
                 #[cfg(feature = "debug_slow_disk")]
