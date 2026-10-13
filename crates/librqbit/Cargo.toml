@@ -27,9 +27,9 @@ default-tls = [
 ]
 miri = []
 prometheus = ["metrics-exporter-prometheus"]
-rust-tls = ["reqwest/rustls-tls", "sha1w/sha1-ring", "librqbit-core/sha1-ring"]
+rust-tls = ["reqwest/rustls", "sha1w/sha1-ring", "librqbit-core/sha1-ring"]
 # Embedders install their own Rustls provider and select hashing separately.
-rust-tls-no-provider = ["reqwest/rustls-tls-webpki-roots-no-provider"]
+rust-tls-no-provider = ["reqwest/rustls-no-provider"]
 sha1-rustcrypto = ["sha1w/sha1-rustcrypto", "librqbit-core/sha1-rustcrypto"]
 storage_middleware = ["lru"]
 storage_examples = []

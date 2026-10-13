@@ -32,25 +32,6 @@ pub struct DhtPersistenceConfig {
     pub config_filename: Option<PathBuf>,
 }
 
-/// Backwards-compatible DHT persistence configuration used by older
-/// `SessionOptions` callers. New code should use [`DhtPersistenceConfig`]
-/// together with the session-level `ipv4_only` setting.
-#[derive(Default)]
-pub struct PersistentDhtConfig {
-    pub dump_interval: Option<Duration>,
-    pub config_filename: Option<PathBuf>,
-    pub ipv4_only: bool,
-}
-
-impl From<PersistentDhtConfig> for DhtPersistenceConfig {
-    fn from(config: PersistentDhtConfig) -> Self {
-        Self {
-            dump_interval: config.dump_interval,
-            config_filename: config.config_filename,
-        }
-    }
-}
-
 /// Compute the DHT listen address from the explicit/stored port preferences and
 /// the session-level `ipv4_only` flag.
 ///
@@ -144,7 +125,7 @@ impl PersistentDht {
 
             if let Some(parent) = config_filename.parent() {
                 std::fs::create_dir_all(parent)
-                    .with_context(|| format!("error creating dir {:?}", &parent))?;
+                    .with_context(|| format!("error creating dir {:?}", parent))?;
             }
 
             let de = match OpenOptions::new().read(true).open(&config_filename) {

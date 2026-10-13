@@ -1,7 +1,6 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    future::Future,
     io::Read,
     net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
@@ -47,10 +46,7 @@ use bencode::bencode_serialize_to_writer;
 use buffers::{ByteBuf, ByteBufOwned};
 use bytes::Bytes;
 use clone_to_owned::CloneToOwned;
-use dht::{
-    Dht, DhtBuilder, DhtConfig, DhtPersistenceConfig, Id20, PersistentDht, PersistentDhtConfig,
-    dht_listen_addr,
-};
+use dht::{Dht, DhtBuilder, DhtConfig, DhtPersistenceConfig, Id20, PersistentDht, dht_listen_addr};
 use futures::{
     FutureExt, Stream, StreamExt, TryFutureExt,
     future::BoxFuture,
@@ -177,6 +173,13 @@ impl reqwest::dns::Resolve for ReqwestDnsResolver {
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
     }
+}
+
+/// A 40 character hex string is a v1 info hash. Checking the length alone
+/// also matches URLs that happen to be 40 characters long, such as
+/// https://nyaa.si/download/1234567.torrent.
+fn is_bare_info_hash(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 async fn torrent_from_url(
@@ -446,15 +449,6 @@ pub struct SessionOptions {
     /// Defaults to DHT enabled with persistence.
     pub dht: Option<DhtSessionConfig>,
 
-    /// Backwards-compatible switch for callers using the pre-9.0 DHT options.
-    pub disable_dht: bool,
-
-    /// Backwards-compatible bootstrap list for callers using the pre-9.0 DHT options.
-    pub dht_bootstrap_addrs: Option<Vec<String>>,
-
-    /// Backwards-compatible persistence settings for callers using the pre-9.0 DHT options.
-    pub dht_config: Option<PersistentDhtConfig>,
-
     /// What network device to bind to for DHT, BT-UDP, BT-TCP, trackers and LSD.
     /// On OSX will use IP(V6)_BOUND_IF, on Linux will use SO_BINDTODEVICE.
     pub bind_device_name: Option<String>,
@@ -524,9 +518,6 @@ impl Default for SessionOptions {
     fn default() -> Self {
         Self {
             dht: Some(DhtSessionConfig::default()),
-            disable_dht: false,
-            dht_bootstrap_addrs: None,
-            dht_config: None,
             bind_device_name: None,
             dns_server: None,
             disable_trackers: false,
@@ -580,30 +571,6 @@ pub(crate) struct CheckedIncomingConnection {
     pub writer: BoxAsyncWrite,
     pub read_buf: ReadBuf,
     pub handshake: Handshake,
-}
-
-enum ListenerEvent<Accepted, Checked> {
-    Accepted(Accepted),
-    HandshakeChecked(Checked),
-}
-
-async fn next_listener_event<AcceptFuture, CheckFuture>(
-    accept: AcceptFuture,
-    checks: &mut FuturesUnordered<CheckFuture>,
-    max_pending_checks: usize,
-) -> ListenerEvent<AcceptFuture::Output, CheckFuture::Output>
-where
-    AcceptFuture: Future,
-    CheckFuture: Future,
-{
-    tokio::select! {
-        accepted = accept, if checks.len() < max_pending_checks => {
-            ListenerEvent::Accepted(accepted)
-        }
-        Some(checked) = checks.next(), if !checks.is_empty() => {
-            ListenerEvent::HandshakeChecked(checked)
-        }
-    }
 }
 
 struct InternalAddResult {
@@ -684,19 +651,7 @@ impl Session {
                 None
             };
 
-            let dht_config = if opts.disable_dht {
-                None
-            } else if opts.dht_config.is_some() || opts.dht_bootstrap_addrs.is_some() {
-                Some(DhtSessionConfig {
-                    bootstrap_addrs: opts.dht_bootstrap_addrs.take(),
-                    port: None,
-                    persistence: opts.dht_config.take().map(Into::into),
-                })
-            } else {
-                opts.dht.take()
-            };
-
-            let dht = if let Some(dht_config) = dht_config {
+            let dht = if let Some(dht_config) = opts.dht.take() {
                 let dht = if let Some(persistence_config) = dht_config.persistence {
                     PersistentDht::create(
                         persistence_config,
@@ -841,7 +796,7 @@ impl Session {
 
             let blocklist = if let Some(blocklist_url) = opts.blocklist_url {
                 info!(url = blocklist_url, "loading p2p blocklist");
-                let bl = IpRanges::load_from_url(&blocklist_url)
+                let bl = IpRanges::load_from_url(&reqwest_client, &blocklist_url)
                     .await
                     .with_context(|| format!("error reading blocklist from {blocklist_url}"))?;
                 info!(len = bl.len(), "loaded blocklist");
@@ -852,7 +807,7 @@ impl Session {
 
             let allowlist = if let Some(allowlist_url) = opts.allowlist_url {
                 info!(url = allowlist_url, "loading p2p allowlist");
-                let al = IpRanges::load_from_url(&allowlist_url)
+                let al = IpRanges::load_from_url(&reqwest_client, &allowlist_url)
                     .await
                     .with_context(|| format!("error reading allowlist from {allowlist_url}"))?;
                 info!(len = al.len(), "loaded allowlist");
@@ -1085,28 +1040,20 @@ impl Session {
         drop(self);
 
         loop {
-            match next_listener_event(l.accept(), &mut futs, max_pending_incoming_handshake_checks)
-                .await
-            {
-                ListenerEvent::Accepted(result) => {
-                    match result {
+            tokio::select! {
+                r = l.accept(), if futs.len() < max_pending_incoming_handshake_checks => {
+                    match r {
                         Ok((addr, (read, write))) => {
                             trace!("accepted connection from {addr}");
                             let session = session.upgrade().context("session is dead")?;
                             let span = debug_span!(parent: session.rs(), "incoming", addr=%addr);
                             futs.push(
-                                session
-                                    .check_incoming_connection(
-                                        addr,
-                                        A::KIND,
-                                        Box::new(read),
-                                        Box::new(write),
-                                    )
+                                session.check_incoming_connection(addr, A::KIND, Box::new(read), Box::new(write))
                                     .map_err(|e| {
                                         debug!("error checking incoming connection: {e:#}");
                                         e
                                     })
-                                    .instrument(span),
+                                    .instrument(span)
                             );
                         }
                         Err(e) => {
@@ -1114,22 +1061,17 @@ impl Session {
                             // Whatever is the reason, ensure we are not stuck trying to
                             // accept indefinitely.
                             tokio::time::sleep(Duration::from_secs(10)).await;
-                            continue;
+                            continue
                         }
                     }
-                }
-                ListenerEvent::HandshakeChecked(result) => {
-                    if let Ok((live, checked)) = result {
-                        let (addr, kind) = (checked.addr, checked.kind);
-                        if let Err(e) = live.add_incoming_peer(checked) {
-                            warn!(
-                                ?addr,
-                                ?kind,
-                                "error handing over incoming connection: {e:#}"
-                            );
-                        }
+                },
+                Some(Ok((live, checked))) = futs.next(), if !futs.is_empty() => {
+                    let (addr, kind) = (checked.addr, checked.kind);
+                    if let Err(e) = live.add_incoming_peer(checked) {
+                        warn!(?addr, ?kind, "error handing over incoming connection: {e:#}");
                     }
-                }
+                },
+                else => continue,
             }
         }
     }
@@ -1159,6 +1101,9 @@ impl Session {
             keep_alive_interval: other
                 .keep_alive_interval
                 .or(self.peer_opts.keep_alive_interval),
+            max_request_window: other
+                .max_request_window
+                .or(self.peer_opts.max_request_window),
         }
     }
 
@@ -1214,7 +1159,9 @@ impl Session {
         async move {
             let mut opts = opts.unwrap_or_default();
             let add_res = match add {
-                AddTorrent::Url(magnet) if magnet.starts_with("magnet:") || magnet.len() == 40 => {
+                AddTorrent::Url(magnet)
+                    if magnet.starts_with("magnet:") || is_bare_info_hash(&magnet) =>
+                {
                     let magnet = Magnet::parse(&magnet)
                         .context("provided path is not a valid magnet URL")?;
                     let info_hash = magnet
@@ -1472,6 +1419,7 @@ impl Session {
                     force_tracker_interval: opts.force_tracker_interval,
                     peer_connect_timeout: peer_opts.connect_timeout,
                     peer_read_write_timeout: peer_opts.read_write_timeout,
+                    peer_max_request_window: peer_opts.max_request_window,
                     allow_overwrite: opts.overwrite,
                     output_folder,
                     ratelimits: opts.ratelimits,
@@ -1944,32 +1892,55 @@ impl tracker_comms::TorrentStatsProvider for PeerRxTorrentInfo {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, time::Duration};
 
     use buffers::ByteBuf;
-    use futures::{future, stream::FuturesUnordered};
     use itertools::Itertools;
     use librqbit_core::torrent_metainfo::{TorrentMetaV1, torrent_from_bytes};
 
-    use super::{
-        ListenerEvent, Session, SessionOptions, next_listener_event, torrent_file_from_info_bytes,
-    };
+    use super::{Session, SessionOptions};
 
     #[tokio::test]
-    async fn failed_handshake_check_at_backlog_cap_is_drained() {
-        const MAX_PENDING: usize = 4;
-        let mut checks = FuturesUnordered::new();
-        for _ in 0..MAX_PENDING {
-            checks.push(future::ready(Err::<(), _>("invalid handshake")));
+    async fn incoming_listener_survives_failed_handshakes_at_backlog_cap() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        crate::tests::test_util::setup_test_logging();
+        let directory = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            directory.path().to_owned(),
+            SessionOptions {
+                dht: None,
+                disable_local_service_discovery: true,
+                listen: Some(crate::ListenerOptions {
+                    listen_addr: ([127, 0, 0, 1], 0).into(),
+                    max_pending_incoming_handshake_checks: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // A single invalid handshake fills the cap. The next connection must
+        // still be accepted and rejected, rather than losing the listener.
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut peer = tokio::net::TcpStream::connect(session.listen_addr().unwrap())
+                    .await
+                    .unwrap();
+                peer.write_all(&[0; 68]).await.unwrap();
+                let mut response = [0; 1];
+                match peer.read(&mut response).await {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    other => panic!("invalid handshake was not rejected: {other:?}"),
+                }
+            })
+            .await
+            .expect("listener stopped processing incoming handshakes");
         }
-
-        let event = next_listener_event(future::pending::<()>(), &mut checks, MAX_PENDING).await;
-
-        assert!(matches!(
-            event,
-            ListenerEvent::HandshakeChecked(Err("invalid handshake"))
-        ));
-        assert_eq!(checks.len(), MAX_PENDING - 1);
+        session.stop().await;
     }
 
     #[tokio::test]
@@ -1988,6 +1959,25 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("dns_server is required"));
+    }
+
+    use super::{is_bare_info_hash, torrent_file_from_info_bytes};
+
+    #[test]
+    fn test_is_bare_info_hash() {
+        assert!(is_bare_info_hash(
+            "08ada5a7a6183aae1e09d831df6748d566095a10"
+        ));
+        assert!(is_bare_info_hash(
+            "08ADA5A7A6183AAE1E09D831DF6748D566095A10"
+        ));
+        // 40 characters, but a URL.
+        assert!(!is_bare_info_hash(
+            "https://nyaa.si/download/2164312.torrent"
+        ));
+        assert!(!is_bare_info_hash(
+            "08ada5a7a6183aae1e09d831df6748d566095a1"
+        ));
     }
 
     #[test]
