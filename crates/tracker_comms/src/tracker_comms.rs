@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::net::SocketAddrV4;
 use std::net::SocketAddrV6;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::bail;
@@ -27,9 +27,18 @@ use crate::tracker_comms_udp::UdpTrackerClient;
 use librqbit_core::dns::HostResolver;
 use librqbit_core::hash_id::Id20;
 use tokio::sync::watch;
+use tokio::time::Instant;
 
 const DEFAULT_ANNOUNCE_PORT: u16 = 4240;
 const PORT_CHANGE_REANNOUNCE_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+struct AnnounceIntervals {
+    regular: Duration,
+    minimum: Duration,
+}
+
+#[cfg(test)]
+mod port_tests;
 
 pub struct TrackerComms {
     info_hash: Id20,
@@ -148,14 +157,15 @@ async fn udp_tracker_to_socket_addrs(
 }
 
 impl TrackerComms {
-    fn announce_port_from(rx: &watch::Receiver<Option<u16>>) -> u16 {
-        (*rx.borrow()).unwrap_or(DEFAULT_ANNOUNCE_PORT)
+    fn announce_port_from(rx: &mut watch::Receiver<Option<u16>>) -> u16 {
+        (*rx.borrow_and_update()).unwrap_or(DEFAULT_ANNOUNCE_PORT)
     }
 
     async fn sleep_until_interval_or_port_change(
         announce_port_rx: &mut watch::Receiver<Option<u16>>,
         interval: Duration,
         last_announce_at: Option<Instant>,
+        minimum: Duration,
     ) {
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
@@ -163,8 +173,9 @@ impl TrackerComms {
                 if changed.is_ok() {
                     if let Some(last_announce_at) = last_announce_at {
                         let elapsed = last_announce_at.elapsed();
-                        if elapsed < PORT_CHANGE_REANNOUNCE_MIN_INTERVAL {
-                            tokio::time::sleep(PORT_CHANGE_REANNOUNCE_MIN_INTERVAL - elapsed).await;
+                        let minimum = minimum.max(PORT_CHANGE_REANNOUNCE_MIN_INTERVAL);
+                        if elapsed < minimum {
+                            tokio::time::sleep(minimum - elapsed).await;
                         }
                     }
                     debug!(
@@ -181,6 +192,31 @@ impl TrackerComms {
     // TODO: fix too many args
     #[allow(clippy::too_many_arguments)]
     pub fn start(
+        info_hash: Id20,
+        peer_id: Id20,
+        trackers: HashSet<Url>,
+        stats: Box<dyn TorrentStatsProvider>,
+        force_interval: Option<Duration>,
+        announce_port: u16,
+        reqwest_client: reqwest::Client,
+        udp_client: UdpTrackerClient,
+    ) -> Option<BoxStream<'static, SocketAddr>> {
+        Self::start_with_options(
+            info_hash,
+            peer_id,
+            trackers,
+            stats,
+            force_interval,
+            watch::channel(Some(announce_port)).1,
+            reqwest_client,
+            udp_client,
+            None,
+        )
+    }
+
+    /// Start with live port updates and optional caller-supplied DNS.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_options(
         info_hash: Id20,
         peer_id: Id20,
         trackers: HashSet<Url>,
@@ -281,31 +317,34 @@ impl TrackerComms {
         trace!(url=%tracker_url, "starting monitor");
         let mut event = Some(tracker_comms_http::TrackerRequestEvent::Started);
         let mut announce_port_rx = self.announce_port_rx.clone();
-        let mut last_announce_at: Option<Instant>;
+        let mut last_announce_at = None;
 
         loop {
-            let interval =
-                (|| self.tracker_one_request_http(&tracker_url, event, &announce_port_rx))
-                    .retry(
-                        ExponentialBuilder::new()
-                            .without_max_times()
-                            .with_jitter()
-                            .with_factor(2.)
-                            .with_min_delay(Duration::from_secs(10))
-                            .with_max_delay(Duration::from_secs(600)),
-                    )
-                    .notify(|err, retry_in| debug!(?retry_in, "error calling tracker: {err:#}"))
-                    .await
-                    .context("this shouldn't fail")?;
+            let interval = (|| {
+                last_announce_at = Some(Instant::now());
+                let port = Self::announce_port_from(&mut announce_port_rx);
+                self.tracker_one_request_http(&tracker_url, event, port)
+            })
+            .retry(
+                ExponentialBuilder::new()
+                    .without_max_times()
+                    .with_jitter()
+                    .with_factor(2.)
+                    .with_min_delay(Duration::from_secs(10))
+                    .with_max_delay(Duration::from_secs(600)),
+            )
+            .notify(|err, retry_in| debug!(?retry_in, "error calling tracker: {err:#}"))
+            .await
+            .context("this shouldn't fail")?;
 
-            last_announce_at = Some(Instant::now());
             event = None;
-            let interval = self.force_tracker_interval.unwrap_or(interval);
-            debug!("sleeping for {:?} after calling tracker", interval);
+            let regular = self.force_tracker_interval.unwrap_or(interval.regular);
+            debug!("sleeping for {:?} after calling tracker", regular);
             Self::sleep_until_interval_or_port_change(
                 &mut announce_port_rx,
-                interval,
+                regular,
                 last_announce_at,
+                interval.minimum,
             )
             .await;
         }
@@ -315,10 +354,9 @@ impl TrackerComms {
         &self,
         tracker_url: &Url,
         event: Option<tracker_comms_http::TrackerRequestEvent>,
-        announce_port_rx: &watch::Receiver<Option<u16>>,
-    ) -> anyhow::Result<Duration> {
+        announce_port: u16,
+    ) -> anyhow::Result<AnnounceIntervals> {
         let stats = self.stats.get();
-        let announce_port = Self::announce_port_from(announce_port_rx);
         let request = tracker_comms_http::TrackerRequest {
             info_hash: &self.info_hash,
             peer_id: &self.peer_id,
@@ -371,9 +409,11 @@ impl TrackerComms {
         for peer in response.iter_peers() {
             self.tx.send(peer).await?;
         }
-        Ok(Duration::from_secs(
-            response.min_interval.unwrap_or(response.interval),
-        ))
+        Ok(AnnounceIntervals {
+            // Preserve upstream's existing regular-announce interval choice.
+            regular: Duration::from_secs(response.min_interval.unwrap_or(response.interval)),
+            minimum: Duration::from_secs(response.min_interval.unwrap_or(0)),
+        })
     }
 
     async fn task_single_tracker_monitor_udp(
@@ -400,6 +440,7 @@ impl TrackerComms {
                     &mut announce_port_rx,
                     i,
                     last_announce_at,
+                    PORT_CHANGE_REANNOUNCE_MIN_INTERVAL,
                 )
                 .await;
             }
@@ -423,17 +464,16 @@ impl TrackerComms {
 
             prev_addrs = Some(addrs);
 
+            last_announce_at = Some(Instant::now());
+            let port = Self::announce_port_from(&mut announce_port_rx);
             match addrs {
                 UdpTrackerResolveResult::One(addr) => {
                     match self
-                        .tracker_one_request_udp(addr, &client, &announce_port_rx)
+                        .tracker_one_request_udp(addr, &client, port)
                         .instrument(trace_span!("udp request", ?addr))
                         .await
                     {
-                        Ok(sleep) => {
-                            last_announce_at = Some(Instant::now());
-                            sleep_interval = Some(sleep)
-                        }
+                        Ok(sleep) => sleep_interval = Some(sleep),
                         Err(_) => {
                             sleep_interval = Some(sleep_interval.unwrap_or(Duration::from_secs(60)))
                         }
@@ -441,14 +481,11 @@ impl TrackerComms {
                 }
                 UdpTrackerResolveResult::Two(v4, v6) => {
                     let (r4, r6) = tokio::join!(
-                        self.tracker_one_request_udp(v4.into(), &client, &announce_port_rx)
+                        self.tracker_one_request_udp(v4.into(), &client, port)
                             .instrument(trace_span!("udp request", addr=?v4)),
-                        self.tracker_one_request_udp(v6.into(), &client, &announce_port_rx)
+                        self.tracker_one_request_udp(v6.into(), &client, port)
                             .instrument(trace_span!("udp request", addr=?v6))
                     );
-                    if r4.is_ok() || r6.is_ok() {
-                        last_announce_at = Some(Instant::now());
-                    }
                     sleep_interval = Some(
                         r4.or(r6)
                             .ok()
@@ -464,12 +501,11 @@ impl TrackerComms {
         &self,
         addr: SocketAddr,
         client: &UdpTrackerClient,
-        announce_port_rx: &watch::Receiver<Option<u16>>,
+        announce_port: u16,
     ) -> anyhow::Result<Duration> {
         use tracker_comms_udp::*;
 
         let stats = self.stats.get();
-        let announce_port = Self::announce_port_from(announce_port_rx);
         let request = AnnounceFields {
             info_hash: self.info_hash,
             peer_id: self.peer_id,

@@ -265,6 +265,36 @@ fn merge_two_optional_streams<T>(
     }
 }
 
+// Recreate discovery sources after a port change, dropping their old tasks
+// before registering replacements. Tracker monitors update independently.
+fn discovery_stream_with_port_updates(
+    mut port_rx: watch::Receiver<Option<u16>>,
+    mut make_stream: impl FnMut(Option<u16>) -> BoxStream<'static, SocketAddr> + Send + 'static,
+) -> BoxStream<'static, SocketAddr> {
+    Box::pin(async_stream::stream! {
+        loop {
+            let port = *port_rx.borrow_and_update();
+            let mut stream = make_stream(port);
+            let mut watch_open = true;
+            loop {
+                tokio::select! {
+                    biased;
+                    changed = port_rx.changed(), if watch_open => {
+                        if changed.is_ok() {
+                            break;
+                        }
+                        watch_open = false;
+                    }
+                    peer = stream.next() => match peer {
+                        Some(peer) => yield peer,
+                        None => return,
+                    }
+                }
+            }
+        }
+    })
+}
+
 /// Options for adding new torrents to the session.
 //
 // Serialize/deserialize is for Tauri.
@@ -638,7 +668,7 @@ impl Session {
 
             let dht = if let Some(dht_config) = opts.dht.take() {
                 let dht = if let Some(persistence_config) = dht_config.persistence {
-                    PersistentDht::create(
+                    PersistentDht::create_with_resolver(
                         persistence_config,
                         dht_config.port,
                         opts.ipv4_only,
@@ -1593,25 +1623,23 @@ impl Session {
         initial_peers: Vec<SocketAddr>,
         is_private: bool,
     ) -> Option<PeerStream> {
-        let dht_rx = if is_private {
+        let discovery_rx = if is_private || (self.dht.is_none() && self.lsd.is_none()) {
             None
         } else {
-            self.dht.as_ref().map(|dht| {
-                dht.get_peers(
-                    info_hash,
-                    if announce { self.announce_port() } else { None },
+            let dht = self.dht.clone();
+            let lsd = self.lsd.clone();
+            let make_stream = move |port| {
+                merge_two_optional_streams(
+                    dht.as_ref().map(|dht| dht.get_peers(info_hash, port)),
+                    lsd.as_ref().map(|lsd| lsd.announce(info_hash, port)),
                 )
-            })
-        };
-
-        let lsd_rx = if is_private {
-            None
-        } else {
-            self.lsd.as_ref().map(|lsd| {
-                lsd.announce(
-                    info_hash,
-                    if announce { self.announce_port() } else { None },
-                )
+                .expect("discovery source exists")
+            };
+            Some(if announce {
+                discovery_stream_with_port_updates(self.announce_port_tx.subscribe(), make_stream)
+            } else {
+                // Metadata-only lookups must never start announcing on updates.
+                make_stream(None)
             })
         };
 
@@ -1633,7 +1661,7 @@ impl Session {
             info_hash,
             session: self.clone(),
         };
-        let tracker_rx = TrackerComms::start(
+        let tracker_rx = TrackerComms::start_with_options(
             info_hash,
             self.peer_id,
             trackers.into_iter().collect(),
@@ -1651,11 +1679,8 @@ impl Session {
             Some(futures::stream::iter(initial_peers))
         };
         merge_two_optional_streams(
-            merge_two_optional_streams(
-                merge_two_optional_streams(dht_rx, tracker_rx),
-                initial_peers_rx,
-            ),
-            lsd_rx,
+            merge_two_optional_streams(discovery_rx, tracker_rx),
+            initial_peers_rx,
         )
     }
 
@@ -1883,6 +1908,48 @@ impl tracker_comms::TorrentStatsProvider for PeerRxTorrentInfo {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn discovery_port_updates_drop_old_sources_and_keep_peer_delivery() {
+        use futures::StreamExt;
+        use tokio::sync::{mpsc, watch};
+        use tokio_util::sync::CancellationToken;
+        let (tx, rx) = watch::channel(Some(41000));
+        let (created_tx, mut created_rx) = mpsc::unbounded_channel();
+        let make = move |port: Option<u16>| {
+            let cancel = CancellationToken::new();
+            let guard = cancel.clone().drop_guard();
+            let (peer_tx, mut peer_rx) = mpsc::unbounded_channel();
+            created_tx.send((port, cancel, peer_tx)).unwrap();
+            Box::pin(async_stream::stream! {
+                let _guard = guard;
+                while let Some(peer) = peer_rx.recv().await { yield peer; }
+            }) as futures::stream::BoxStream<'static, std::net::SocketAddr>
+        };
+        let mut stream = super::discovery_stream_with_port_updates(rx, make);
+        let next = stream.next();
+        tokio::pin!(next);
+        assert!(futures::poll!(next.as_mut()).is_pending());
+        let (port, old_cancel, old_peers) = created_rx.recv().await.unwrap();
+        assert_eq!(port, Some(41000));
+        tx.send_replace(Some(41001));
+        tx.send_replace(None);
+        assert!(futures::poll!(next.as_mut()).is_pending());
+        assert!(
+            old_cancel.is_cancelled(),
+            "old announcement tasks must stop"
+        );
+        let (port, current_cancel, peers) = created_rx.recv().await.unwrap();
+        assert_eq!(port, None);
+        assert!(old_peers.send(([127, 0, 0, 1], 41000).into()).is_err());
+        let peer = ([127, 0, 0, 1], 42000).into();
+        peers.send(peer).unwrap();
+        assert_eq!(next.await, Some(peer));
+        drop(tx);
+        peers.send(peer).unwrap();
+        assert_eq!(stream.next().await, Some(peer));
+        drop(stream);
+        assert!(current_cancel.is_cancelled());
+    }
     use std::{
         sync::{
             Arc,

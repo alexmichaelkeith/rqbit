@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     io::SeekFrom,
     sync::{
         Arc,
@@ -57,7 +57,7 @@ pub(crate) struct TorrentStreams {
     streams: DashMap<StreamId, StreamState>,
     requested_pieces: RwLock<Option<Arc<[ValidPieceIndex]>>>,
     pub(crate) new_pieces_notify: Notify,
-    background_download: AtomicBool,
+    background_completion: AtomicBool,
 }
 
 impl Default for TorrentStreams {
@@ -68,7 +68,7 @@ impl Default for TorrentStreams {
             requested_pieces: RwLock::new(None),
             new_pieces_notify: Notify::new(),
             // Ordinary rqbit downloads retain upstream's completion behavior.
-            background_download: AtomicBool::new(true),
+            background_completion: AtomicBool::new(true),
         }
     }
 }
@@ -121,15 +121,19 @@ impl TorrentStreams {
     }
 
     /// Ordering, deduplication and consumer lifetimes belong to the caller.
-    fn set_piece_request(&self, pieces: Option<Vec<ValidPieceIndex>>) -> bool {
+    fn set_piece_request_queue(&self, pieces: Option<Vec<ValidPieceIndex>>) -> bool {
         let mut current = self.requested_pieces.write();
         if current.as_deref() == pieces.as_deref() {
             return false;
         }
         let reconnect = pieces.as_ref().is_none_or(|pieces| {
-            pieces
+            let previous: HashSet<_> = current
+                .as_deref()
+                .unwrap_or_default()
                 .iter()
-                .any(|piece| !current.as_deref().unwrap_or_default().contains(piece))
+                .copied()
+                .collect();
+            pieces.iter().any(|piece| !previous.contains(piece))
         });
         *current = pieces.map(Arc::from);
         drop(current);
@@ -142,8 +146,8 @@ impl TorrentStreams {
             .as_deref()
             .is_some_and(|pieces| pieces.contains(&piece))
     }
-    pub(crate) fn background_download_enabled(&self) -> bool {
-        self.background_download.load(Ordering::Relaxed)
+    pub(crate) fn background_completion_enabled(&self) -> bool {
+        self.background_completion.load(Ordering::Relaxed)
     }
 
     pub(crate) fn wake_streams_on_piece_completed(
@@ -359,10 +363,72 @@ impl ManagedTorrent {
         })
     }
 
-    /// Some supplies the exact ordered queue, including an empty queue.
-    /// None restores upstream's automatic reader lookahead.
-    pub fn set_piece_request(&self, pieces: Option<Vec<ValidPieceIndex>>) -> anyhow::Result<()> {
-        if self.streams()?.set_piece_request(pieces) {
+    /// Replace the torrent's ordered piece request queue.
+    ///
+    /// `Some(pieces)` overrides automatic reader lookahead. `Some(Vec::new())`
+    /// supplies no priority pieces; `None` restores automatic reader lookahead.
+    /// Selected files still complete unless background completion is disabled
+    /// with [`Self::set_background_completion`].
+    ///
+    /// Queue order guides piece acquisition, subject to peer availability and
+    /// pieces already in flight; it does not guarantee completion order.
+    /// Replacing the queue does not cancel requests already sent to peers.
+    /// There is one queue per torrent. Combining consumer requests and removing
+    /// duplicates belong to the caller. Indices are checked against this
+    /// torrent before replacing the queue; an invalid queue leaves the current
+    /// queue intact. The queue can be replaced while the torrent is live or paused.
+    /// Pause/resume retains the queue. Concurrent setters replace the same queue;
+    /// the caller coordinates ownership. Dropping a reader does not reset it.
+    /// To control demand before any payload is requested, add the torrent paused,
+    /// wait for initialization, configure both controls, and then unpause it.
+    /// The two setters are independent operations, not an atomic mode switch.
+    ///
+    /// # Example
+    ///
+    /// Request the last and first pieces, then let the application read the
+    /// corresponding byte ranges. Restore normal scheduling when it is done.
+    ///
+    /// ```no_run
+    /// use librqbit::ManagedTorrent;
+    ///
+    /// async fn request_ends(handle: &ManagedTorrent) -> anyhow::Result<()> {
+    ///     handle.wait_until_initialized().await?;
+    ///     let pieces = handle.with_metadata(|metadata| {
+    ///         let lengths = metadata.lengths();
+    ///         let mut pieces = vec![lengths.last_piece_id()];
+    ///         if lengths.total_pieces() > 1 {
+    ///             pieces.push(lengths.validate_piece_index(0).unwrap());
+    ///         }
+    ///         pieces
+    ///     })?;
+    ///     handle.set_background_completion(false)?;
+    ///     handle.set_piece_request_queue(Some(pieces))
+    /// }
+    ///
+    /// fn restore_downloads(handle: &ManagedTorrent) -> anyhow::Result<()> {
+    ///     handle.set_piece_request_queue(None)?;
+    ///     handle.set_background_completion(true)
+    /// }
+    /// ```
+    pub fn set_piece_request_queue(
+        &self,
+        pieces: Option<Vec<ValidPieceIndex>>,
+    ) -> anyhow::Result<()> {
+        let streams = self.streams()?;
+        if let Some(pieces) = pieces.as_ref() {
+            self.with_metadata(|metadata| {
+                if let Some(piece) = pieces.iter().find(|piece| {
+                    metadata
+                        .lengths()
+                        .validate_piece_index(piece.get())
+                        .is_none()
+                }) {
+                    anyhow::bail!("piece {} is outside this torrent", piece.get());
+                }
+                Ok(())
+            })??;
+        }
+        if streams.set_piece_request_queue(pieces) {
             self.with_state(|state| {
                 if let crate::ManagedTorrentState::Live(l) = state {
                     l.reconnect_all_not_needed_peers();
@@ -372,11 +438,21 @@ impl ManagedTorrent {
         Ok(())
     }
 
-    /// When disabled, fetch only the caller queue or upstream reader demand.
-    /// When enabled, remaining selected-file pieces use upstream scheduling.
-    pub fn set_background_download(&self, enabled: bool) -> anyhow::Result<()> {
+    /// Enable or disable completion of the remaining selected-file pieces.
+    ///
+    /// Enabled by default. When disabled, new piece acquisition uses only the
+    /// explicit request queue, or automatic reader lookahead if no queue is set.
+    /// When enabled, selected-file scheduling provides the fallback after those
+    /// priority pieces. This does not pause the torrent or cancel peer requests
+    /// already in flight. With an explicit empty queue and completion disabled,
+    /// no additional missing pieces are selected.
+    pub fn set_background_completion(&self, enabled: bool) -> anyhow::Result<()> {
         let streams = self.streams()?;
-        if streams.background_download.swap(enabled, Ordering::Relaxed) != enabled {
+        if streams
+            .background_completion
+            .swap(enabled, Ordering::Relaxed)
+            != enabled
+        {
             streams.new_pieces_notify.notify_waiters();
             if enabled {
                 self.with_state(|state| {
@@ -490,6 +566,73 @@ impl FileStream {
 #[cfg(test)]
 mod demand_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "CPU-only queue benchmark; run in release mode with --ignored --nocapture"]
+    fn piece_queue_update_benchmark() {
+        use std::hint::black_box;
+        let lengths = Lengths::new(16_384 * 32_768, 32_768).unwrap();
+        let measure = |label: &str, size, iterations, mut operation: Box<dyn FnMut()>| {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                operation();
+            }
+            println!(
+                "queue-bench {label} size={size} iterations={iterations} ns/op={}",
+                start.elapsed().as_nanos() / iterations as u128
+            );
+        };
+        let streams = Arc::new(TorrentStreams::default());
+        measure(
+            "unset",
+            0,
+            100_000,
+            Box::new(move || {
+                black_box(streams.iter_next_pieces(&lengths).count());
+            }),
+        );
+        for size in [16, 128, 1024, 8192] {
+            let pieces: Vec<_> = (0..size)
+                .map(|index| lengths.validate_piece_index(index).unwrap())
+                .collect();
+            let streams = Arc::new(TorrentStreams::default());
+            streams.set_piece_request_queue(Some(pieces.clone()));
+            let iterations = (1_000_000 / (size * size)).clamp(8, 1000);
+            let same = streams.clone();
+            let original = pieces.clone();
+            measure(
+                "identical",
+                size,
+                iterations,
+                Box::new(move || {
+                    black_box(same.set_piece_request_queue(Some(original.clone())));
+                }),
+            );
+            let mut reversed = pieces.clone();
+            reversed.reverse();
+            let reorder = streams.clone();
+            let mut alternate = false;
+            measure(
+                "reorder",
+                size,
+                iterations,
+                Box::new(move || {
+                    alternate = !alternate;
+                    let next = if alternate { &reversed } else { &pieces };
+                    black_box(reorder.set_piece_request_queue(Some(next.clone())));
+                }),
+            );
+            measure(
+                "missing-membership",
+                size,
+                10_000,
+                Box::new(move || {
+                    black_box(streams.is_piece_requested(lengths.last_piece_id()));
+                }),
+            );
+        }
+    }
+
     #[tokio::test]
     async fn caller_queue_keeps_order_and_only_changed_requests_wake_peers() {
         let lengths = Lengths::new(100 * 1024 * 1024, 1024 * 1024).unwrap();
@@ -499,7 +642,7 @@ mod demand_tests {
                 .map(|&i| lengths.validate_piece_index(i).unwrap())
                 .collect()
         };
-        assert!(streams.set_piece_request(Some(pieces(&[50, 2, 51]))));
+        assert!(streams.set_piece_request_queue(Some(pieces(&[50, 2, 51]))));
         assert_eq!(
             streams
                 .iter_next_pieces(&lengths)
@@ -510,12 +653,12 @@ mod demand_tests {
         let wake = streams.new_pieces_notify.notified();
         tokio::pin!(wake);
         assert!(futures::poll!(wake.as_mut()).is_pending());
-        assert!(!streams.set_piece_request(Some(pieces(&[50, 2, 51]))));
+        assert!(!streams.set_piece_request_queue(Some(pieces(&[50, 2, 51]))));
         assert!(futures::poll!(wake.as_mut()).is_pending());
-        assert!(!streams.set_piece_request(Some(pieces(&[2, 50, 51]))));
+        assert!(!streams.set_piece_request_queue(Some(pieces(&[2, 50, 51]))));
         assert!(futures::poll!(wake.as_mut()).is_ready());
-        assert!(!streams.set_piece_request(Some(Vec::new())));
+        assert!(!streams.set_piece_request_queue(Some(Vec::new())));
         assert!(streams.iter_next_pieces(&lengths).next().is_none());
-        assert!(streams.set_piece_request(None));
+        assert!(streams.set_piece_request_queue(None));
     }
 }

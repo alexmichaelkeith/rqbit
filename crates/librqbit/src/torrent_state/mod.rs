@@ -58,16 +58,31 @@ pub use self::streaming::FileStream;
 /// Piece availability and scheduling state captured for inspection.
 #[derive(Debug)]
 pub struct PieceSnapshot {
-    /// 0 = empty, 1 = verified, 2 = queued, 3 = in-flight.
-    pub states: Vec<u8>,
+    pub states: Vec<PieceState>,
     pub piece_length: u32,
+}
+
+/// Availability and current scheduling state of a torrent piece.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PieceState {
+    Missing,
+    Verified,
+    Queued,
+    InFlight,
 }
 
 impl PieceSnapshot {
     fn from_have(have: &crate::type_aliases::BS, lengths: &Lengths) -> Self {
         Self {
             states: (0..lengths.total_pieces() as usize)
-                .map(|index| u8::from(have.get(index).is_some_and(|bit| *bit)))
+                .map(|index| {
+                    if have.get(index).is_some_and(|bit| *bit) {
+                        PieceState::Verified
+                    } else {
+                        PieceState::Missing
+                    }
+                })
                 .collect(),
             piece_length: lengths.default_piece_length(),
         }

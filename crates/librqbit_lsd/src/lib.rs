@@ -15,7 +15,7 @@ use librqbit_core::{Id20, spawn_utils::spawn_with_cancel};
 use librqbit_dualstack_sockets::{BindDevice, MulticastUdpSocket};
 use parking_lot::RwLock;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, debug_span, trace};
 
 const LSD_PORT: u16 = 6771;
@@ -62,11 +62,59 @@ struct Announce {
     last_reply_ipv6: RateLimiter,
 }
 
+type Announcements = Arc<RwLock<HashMap<Id20, Announce>>>;
+
+// The result stream owns the lifetime of its periodic announcement task.
+struct AddrStream {
+    info_hash: Id20,
+    rx: UnboundedReceiver<SocketAddr>,
+    receivers: Announcements,
+    _announce_guard: DropGuard,
+}
+
+impl AddrStream {
+    fn new(
+        info_hash: Id20,
+        receivers: Announcements,
+        parent: &CancellationToken,
+    ) -> (Self, UnboundedSender<SocketAddr>, CancellationToken) {
+        let (tx, rx) = unbounded_channel();
+        let token = parent.child_token();
+        (
+            Self {
+                info_hash,
+                rx,
+                receivers,
+                _announce_guard: token.clone().drop_guard(),
+            },
+            tx,
+            token,
+        )
+    }
+}
+
+impl Stream for AddrStream {
+    type Item = SocketAddr;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+impl Drop for AddrStream {
+    fn drop(&mut self) {
+        self.receivers.write().remove(&self.info_hash);
+    }
+}
+
 struct LocalServiceDiscoveryInner {
     socket: MulticastUdpSocket,
     cookie: u32,
     cancel_token: CancellationToken,
-    receivers: RwLock<HashMap<Id20, Announce>>,
+    receivers: Announcements,
 }
 
 #[derive(Clone)]
@@ -237,30 +285,11 @@ cookie: {cookie}\r
         // 1. Periodically announce the torrent.
         // 2. Stream back the results from received messages.
 
-        let (tx, rx) = unbounded_channel::<SocketAddr>();
-
-        struct AddrStream {
-            info_hash: Id20,
-            rx: UnboundedReceiver<SocketAddr>,
-            lsd: LocalServiceDiscovery,
-        }
-
-        impl Stream for AddrStream {
-            type Item = SocketAddr;
-
-            fn poll_next(
-                mut self: std::pin::Pin<&mut Self>,
-                cx: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<Option<Self::Item>> {
-                self.rx.poll_recv(cx)
-            }
-        }
-
-        impl Drop for AddrStream {
-            fn drop(&mut self) {
-                let _ = self.lsd.inner.receivers.write().remove(&self.info_hash);
-            }
-        }
+        let (stream, tx, cancel_token) = AddrStream::new(
+            info_hash,
+            self.inner.receivers.clone(),
+            &self.inner.cancel_token,
+        );
 
         self.inner.receivers.write().insert(
             info_hash,
@@ -273,7 +302,6 @@ cookie: {cookie}\r
         );
 
         if let Some(announce_port) = announce_port {
-            let cancel_token = self.inner.cancel_token.child_token();
             spawn_with_cancel(
                 debug_span!(parent: None, "lsd-announce", ?info_hash, port=announce_port),
                 "lsd-announce",
@@ -283,11 +311,7 @@ cookie: {cookie}\r
             );
         }
 
-        AddrStream {
-            info_hash,
-            rx,
-            lsd: self.clone(),
-        }
+        stream
     }
 }
 
@@ -345,5 +369,51 @@ fn try_parse_bt_search<'a: 'h, 'h>(
             }
         }
         _ => anyhow::bail!("expecting BT-SEARCH"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn dropping_discovery_stream_stops_its_announcement_task() {
+        let parent = CancellationToken::new();
+        let sibling = parent.child_token();
+        let receivers = Announcements::default();
+        let hash = Id20::new([1; 20]);
+        let (mut stream, tx, token) = AddrStream::new(hash, receivers.clone(), &parent);
+        receivers.write().insert(
+            hash,
+            Announce {
+                tx: tx.clone(),
+                port: Some(4242),
+                last_reply_ipv4: Default::default(),
+                last_reply_ipv6: Default::default(),
+            },
+        );
+        // Exercise the same cancellation wrapper as the network task without
+        // opening a multicast socket or sending anything onto the local LAN.
+        let task = spawn_with_cancel(
+            debug_span!("test-announce"),
+            "test-announce",
+            token.clone(),
+            std::future::pending::<Result<(), std::convert::Infallible>>(),
+        );
+        let peer = (Ipv4Addr::LOCALHOST, 4242).into();
+        tx.send(peer).unwrap();
+        assert_eq!(stream.next().await, Some(peer));
+        assert!(!token.is_cancelled());
+        drop(stream);
+        assert!(receivers.read().is_empty());
+        assert!(tx.is_closed());
+        assert!(token.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!parent.is_cancelled());
+        assert!(!sibling.is_cancelled());
     }
 }

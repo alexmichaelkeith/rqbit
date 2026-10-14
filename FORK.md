@@ -1,11 +1,15 @@
 # OpenPVR integration fork
 
-Local experiment: `openpvr/explicit-piece-demand-local` simplifies the published
-integration below. It is not pushed. rqbit executes one exact ordered piece
+The `openpvr/upstream-20261012` integration branch provides the torrent engine
+used by OpenPVR. rqbit executes one exact ordered piece
 queue and exposes background completion. OpenPVR owns read windows, consumer
 budgets, fairness, deduplication and demand leases. The engine contains no
 viewer IDs or per-reader priority controls. Ordinary rqbit readers retain
 upstream lookahead when no caller-controlled queue is supplied.
+The public controls are `set_piece_request_queue` and
+`set_background_completion`: piece selection and scheduling are general
+embedding capabilities. Queue order guides acquisition, not completion order,
+and queue changes do not cancel peer requests already in flight.
 OpenPVR's `examples/local_torrent_seed.rs` provides the loopback-only seeder
 and tracker used for playback checks; the fixture stays with the application.
 
@@ -21,9 +25,13 @@ librqbit inline in OpenPVR; application policy belongs in OpenPVR.
   requests, and explicit background completion. `Some(empty)` requests no
   pieces; `None` restores upstream reader scheduling. OpenPVR owns all
   consumer coordination and releases demand on scope exit or cancellation.
+  Queue updates validate indices against their own torrent. A temporary
+  membership set avoids quadratic comparisons when reordering long queues;
+  ordering and wakeup behavior are unchanged. Pause/resume retains demand.
 - **Piece inspection:** exported `FileStream`, piece indices and
-  `PieceSnapshot` support embedding and diagnostics. The snapshot supplies
-  verified, queued and in-flight states with piece length in one read.
+  `PieceSnapshot` and its typed `PieceState` support embedding and diagnostics.
+  The snapshot supplies verified, queued and in-flight states with piece length
+  in one read. Administrative wire codes remain in OpenPVR.
   OpenPVR uses upstream `Api::api_dump_haves` for compact bitfields and
   `TorrentStorage::on_piece_completed` for notifications. Requested-piece
   highlighting belongs to OpenPVR; the fork has no custom bitmap accessor,
@@ -37,10 +45,15 @@ librqbit inline in OpenPVR; application policy belongs in OpenPVR.
 - **Port forwarding:** update the announced port while a session is running
   and wake tracker announcements when it changes. OpenPVR uses this when a
   forwarded VPN port changes. The watch channel is the sole port state and
-  retains updates even before any tracker subscribes.
+  retains updates even before any tracker subscribes. Updates coalesce, HTTP
+  tracker minimum intervals are respected, and existing DHT/LSD discovery
+  sources are recreated after their old tasks are dropped. LSD's periodic
+  announcement task is cancelled when its stream is dropped. Passive metadata
+  lookups do not start announcing because a session port changes.
 - **Independent crypto selection:** `rust-tls-no-provider` lets the embedding
-  app install its Rustls provider, while `sha1-rustcrypto` selects RustCrypto
-  hashing with CPU intrinsics independently of TLS.
+  app install its Rustls provider. `sha1-crypto-hash`, `sha1-ring` and
+  `sha1-rustcrypto` select hashing independently of TLS; the last selects
+  RustCrypto hashing with CPU intrinsics.
 - **uTP dependency patch:** the vendored 0.7.0 package still needs its
   `ringbuf >=0.5.2` change; see `vendor/librqbit-utp/OPENPVR-PATCH.md`.
 
@@ -62,6 +75,11 @@ the RustCrypto hashing backend, live announce-port updates, generic DNS
 injection, piece inspection and caller-controlled piece scheduling. Preserve
 upstream defaults and keep application fixtures and this fork's documentation
 out of those patches. Discuss scheduling API shape before proposing it.
+Prepare the LSD announcement-lifetime fix and the native `FileStream` export
+as smaller independent contributions. Base port updates on the LSD cleanup.
+Each proposal includes its minimal dependency-lock delta when needed; validate
+the actual proposed tree without dependency or fixture overlays. The uTP
+packaging-lock delta is separate until upstream Git tracking is verified.
 
 Coordinate piece inspection with existing upstream bitfield/progress work
 (PRs #574 and #650). A compact bitfield API and storage completion callback
@@ -71,8 +89,8 @@ provider-free configuration. Local Mac/OpenPVR checks alone do not qualify
 every upstream binary, desktop app or feature combination.
 
 Upstream requires AI-assistance disclosure and human review/understanding;
-see https://github.com/ikatson/rqbit/blob/main/AI_POLICY.md. No upstream
-submission or remote push is part of this local experiment.
+see https://github.com/ikatson/rqbit/blob/main/AI_POLICY.md. Publishing this
+integration to the OpenPVR fork does not submit any upstream contributions.
 
 ## Updating again
 

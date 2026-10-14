@@ -110,6 +110,27 @@ impl PersistentDht {
         bootstrap_addrs: Option<Vec<String>>,
         cancellation_token: Option<CancellationToken>,
         bind_device: Option<&'a BindDevice>,
+    ) -> BoxFuture<'a, anyhow::Result<Dht>> {
+        Self::create_with_resolver(
+            persistence_config,
+            port,
+            ipv4_only,
+            bootstrap_addrs,
+            cancellation_token,
+            bind_device,
+            None,
+        )
+    }
+
+    /// Create a persistent DHT with caller-supplied bootstrap resolution.
+    #[inline(never)]
+    pub fn create_with_resolver<'a>(
+        persistence_config: DhtPersistenceConfig,
+        port: Option<u16>,
+        ipv4_only: bool,
+        bootstrap_addrs: Option<Vec<String>>,
+        cancellation_token: Option<CancellationToken>,
+        bind_device: Option<&'a BindDevice>,
         resolver: Option<Arc<dyn HostResolver>>,
     ) -> BoxFuture<'a, anyhow::Result<Dht>> {
         async move {

@@ -730,12 +730,12 @@ impl TorrentStateLive {
 
         for piece in pieces.iter_inflight_pieces() {
             let index = piece.get_usize();
-            if snapshot.states.get(index) == Some(&0) {
-                snapshot.states[index] = 3;
+            if snapshot.states.get(index) == Some(&super::PieceState::Missing) {
+                snapshot.states[index] = super::PieceState::InFlight;
             }
         }
 
-        let file_priorities = if self.streams.background_download_enabled() {
+        let file_priorities = if self.streams.background_completion_enabled() {
             g.file_priorities.as_slice()
         } else {
             &[]
@@ -746,8 +746,8 @@ impl TorrentStateLive {
             .chain(chunks.iter_queued_pieces(file_priorities, &self.metadata.file_infos))
         {
             let index = piece.get_usize();
-            if snapshot.states.get(index) == Some(&0) {
-                snapshot.states[index] = 2;
+            if snapshot.states.get(index) == Some(&super::PieceState::Missing) {
+                snapshot.states[index] = super::PieceState::Queued;
             }
         }
 
@@ -1477,7 +1477,7 @@ impl PeerHandler {
                     ..
                 } = &mut **g;
                 let pieces = pieces.as_mut().ok_or(Error::ChunkTrackerEmpty)?;
-                let file_priorities = if !self.state.streams.background_download_enabled() {
+                let file_priorities = if !self.state.streams.background_completion_enabled() {
                     &[][..]
                 } else {
                     file_priorities.as_slice()

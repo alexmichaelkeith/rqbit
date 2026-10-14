@@ -971,6 +971,9 @@ struct DhtWorker {
     resolver: Option<Arc<dyn HostResolver>>,
 }
 
+#[cfg(test)]
+mod resolver_tests;
+
 // Windows fails recv_from on a UDP socket with these for a single datagram, and the socket keeps
 // working afterwards:
 // - WSAEMSGSIZE: the datagram was longer than the buffer and got truncated.

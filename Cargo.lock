@@ -3309,6 +3309,7 @@ dependencies = [
  "parking_lot",
  "rand 0.10.3",
  "reqwest",
+ "rustls",
  "serde",
  "serde_derive",
  "serde_with",

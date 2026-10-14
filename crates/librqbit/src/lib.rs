@@ -96,8 +96,23 @@ pub use session::{
     SUPPORTED_SCHEMES, Session, SessionOptions, SessionPersistenceConfig,
 };
 pub use stream_connect::ConnectionOptions;
+/// The native asynchronous reader returned by [`ManagedTorrent::stream`].
+///
+/// Embedders can name this type when wrapping or storing readers:
+///
+/// ```no_run
+/// use librqbit::FileStream;
+/// use tokio::io::AsyncReadExt;
+///
+/// async fn read_prefix(mut reader: FileStream) -> std::io::Result<Vec<u8>> {
+///     let mut bytes = vec![0; 1024];
+///     reader.read_exact(&mut bytes).await?;
+///     Ok(bytes)
+/// }
+/// ```
+pub use torrent_state::FileStream;
 pub use torrent_state::{
-    FileStream, ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, PieceSnapshot,
+    ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, PieceSnapshot, PieceState,
     TorrentMetadata, TorrentStats, TorrentStatsState,
 };
 pub use type_aliases::FileInfos;

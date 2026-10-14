@@ -60,3 +60,34 @@ jobs:
       - name: Run tests
         if: ${{ matrix.os == 'ubuntu-latest' }}
         run: cargo test
+
+  embedding-tls:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+        hash: [sha1-ring, sha1-crypto-hash]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: embedding-${{ matrix.hash }}
+      - name: Test provider-free TLS with an existing hash backend
+        run: cargo test -p librqbit -p librqbit-core -p librqbit-tracker-comms -p librqbit-dht -p librqbit-sha1-wrapper --no-default-features --features librqbit/rust-tls-no-provider,librqbit/${{ matrix.hash }}
+
+  rustcrypto-hashing:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: rustcrypto-hashing
+      - name: Test the independent RustCrypto hash backend
+        run: cargo test -p librqbit-core -p librqbit-sha1-wrapper --no-default-features --features librqbit-core/sha1-rustcrypto,librqbit-sha1-wrapper/sha1-rustcrypto
+      - name: Check the library hash feature without selecting TLS
+        run: cargo check -p librqbit --lib --no-default-features --features sha1-rustcrypto

@@ -222,22 +222,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_from_plaintext_file() -> Result<()> {
-        // Create a temporary file
-        let mut temp_file = tokio::fs::File::create("temp_list.txt").await?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("list.txt");
+        let mut temp_file = tokio::fs::File::create(&path).await?;
         tokio::io::AsyncWriteExt::write_all(&mut temp_file, LIST).await?;
-        drop(temp_file); // Close the file
+        // Tokio writes can complete in the background; wait before reopening.
+        temp_file.flush().await?;
+        drop(temp_file);
 
         // Load the list from the file
-        let list = IpRanges::load_from_file("temp_list.txt").await?;
+        let list = IpRanges::load_from_file(&path).await?;
 
         // Verify the list
         assert!(list.has("192.168.1.1".parse().unwrap()));
         assert!(!list.has("8.8.8.8".parse().unwrap()));
         assert!(list.has("2001:db8::1".parse().unwrap()));
         assert!(!list.has("2001:4860:4860::8888".parse().unwrap()));
-
-        // Clean up the temporary file
-        tokio::fs::remove_file("temp_list.txt").await?;
 
         Ok(())
     }
