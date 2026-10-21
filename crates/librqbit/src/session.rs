@@ -781,7 +781,13 @@ impl Session {
                     let mut b = reqwest::Client::builder();
                     #[cfg(not(windows))]
                     if let Some(bd) = opts.bind_device_name.as_ref() {
-                        b = b.interface(bd);
+                        b = b.interface(bd).no_proxy();
+                    }
+                    #[cfg(windows)]
+                    if let Some(device) = bind_device.as_ref() {
+                        b = b
+                            .local_address(std::net::IpAddr::V4(device.source_ipv4()))
+                            .no_proxy();
                     }
                     b
                 };
