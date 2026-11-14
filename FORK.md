@@ -1,6 +1,6 @@
 # OpenPVR integration fork
 
-The `openpvr/upstream-20261012` integration branch provides the torrent engine
+The `openpvr/upstream-20261114` integration branch provides the torrent engine
 used by OpenPVR. rqbit executes one exact ordered piece
 queue and exposes background completion. OpenPVR owns read windows, consumer
 budgets, fairness, deduplication and demand leases. The engine contains no
@@ -13,8 +13,8 @@ and queue changes do not cancel peer requests already in flight.
 OpenPVR's `examples/local_torrent_seed.rs` provides the loopback-only seeder
 and tracker used for playback checks; the fixture stays with the application.
 
-The `openpvr/upstream-20261012` integration branch includes upstream
-`ikatson/rqbit` main through `57e95d16c830863a1fde32d8fa98153b53a3d0b4` (9.0.1), fetched on 2026-10-12.
+The `openpvr/upstream-20261114` integration branch includes upstream
+`ikatson/rqbit` main through `4309d38769ef93f6ee4f01a1ab147009a197fa8f` (9.1.0), fetched on 2026-11-14.
 OpenPVR's `Cargo.toml` selects the integration branch and its `Cargo.lock`
 records the exact revision. Keep engine fixes here rather than patching
 librqbit inline in OpenPVR; application policy belongs in OpenPVR.
@@ -56,6 +56,11 @@ librqbit inline in OpenPVR; application policy belongs in OpenPVR.
   RustCrypto hashing with CPU intrinsics.
 - **uTP dependency patch:** the vendored 0.7.0 package still needs its
   `ringbuf >=0.5.2` change; see `vendor/librqbit-utp/OPENPVR-PATCH.md`.
+
+Upstream 9.1.0 now also cancels LSD announcements on stream removal. The fork
+retains its equivalent DropGuard implementation and deterministic regression
+because live port updates recreate these streams. The merge uses the stream
+owner's token for the announcer; a second child token would defeat cancellation.
 
 ## Retired custom changes
 

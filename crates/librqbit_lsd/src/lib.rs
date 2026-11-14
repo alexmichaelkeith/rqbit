@@ -305,7 +305,7 @@ cookie: {cookie}\r
             spawn_with_cancel(
                 debug_span!(parent: None, "lsd-announce", ?info_hash, port=announce_port),
                 "lsd-announce",
-                cancel_token,
+                cancel_token.clone(),
                 self.clone()
                     .task_announce_periodically(info_hash, announce_port),
             );
